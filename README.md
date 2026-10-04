@@ -18,7 +18,7 @@ The system automatically organizes files and secrets in the following structure:
 
 └── **`db\_manage/`**
 
-├── **`database/           \\\`**# Databases directory
+├── **`database/`**# Databases directory
 
 │   └── **`\\\<db\\\_name\\\>/`**
 
