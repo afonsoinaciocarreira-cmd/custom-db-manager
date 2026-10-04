@@ -97,17 +97,17 @@ All requests made to the API require secret key validation. You can provide it i
 Below are practical examples of how to consume API endpoints (e.g., querying table data) across various programming languages. *(Replace `http://localhost:8080` with your actual protocol, address, and port configuration, and `your_secret_key` with your Secret Key)(Any existing command is considered an endpoint).*
 
 ### 1\. cURL (Command Line)
-
+```
 curl \-X GET "http\://localhost:8080/select\_from/users" \\
 
  \\-H "X-Secret-Key: your\\\_secret\\\_key"
 
 *(If using **HTTPS** with a self-signed certificate, add the `-k` flag to bypass security warnings).*
-
+```
 ---
 
 ### 2\. Python (`requests`)
-
+```
 import requests
 
 url \= "http\://localhost:8080/select\_from/users"
@@ -117,7 +117,7 @@ headers \= {"X-Secret-Key": "your\_secret\_key"}
 response \= requests.get(url, headers=headers, verify=False)  \# verify=False only for self-signed HTTPS
 
 print(response.json())
-
+```
 ---
 
 ### 3\. JavaScript / Node.js (`fetch`)
