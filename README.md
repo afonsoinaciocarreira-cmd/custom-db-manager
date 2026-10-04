@@ -9,6 +9,7 @@ A lightweight database management system written in Shell Script (`/bin/sh`), fe
 The system automatically organizes files and secrets in the following structure:
 
 <img width="473" height="33" alt="image" src="https://github.com/user-attachments/assets/413d725d-78db-40fb-bd84-6d8278b31308" />
+
 <img width="249" height="26" alt="image" src="https://github.com/user-attachments/assets/a2091f44-8741-4430-8be4-efd2d6e83777" />
 <img width="485" height="34" alt="image" src="https://github.com/user-attachments/assets/45a044c2-43e4-4270-b708-8290f2a36b15" />
 
