@@ -249,9 +249,8 @@ static async Task Main()
 }
 ```
 ---
-```
 ### 7\. Java (`HttpClient`)
-
+```
 import java.net.URI;
 
 import java.net.http.HttpClient;
