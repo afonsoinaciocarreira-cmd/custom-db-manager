@@ -11,7 +11,7 @@ The system automatically organizes files and secrets in the following structure:
 <img width="439" height="29" alt="image" src="https://github.com/user-attachments/assets/bb471967-3b9b-4793-89ae-ca2641e053a7" />
 
 .  
-├── mainDir\_system/  
+├── mainDir/  
 ├── customdb.sh                \# Main CLI script
 
 └── db\_manage/
