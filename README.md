@@ -242,7 +242,7 @@ public static void main(String[] args) throws Exception {
 ```
 `Output:`
 
-link
+<img width="363" height="285" alt="image" src="https://github.com/user-attachments/assets/3f17efa4-5600-4ce5-acca-b008d4940de4" />
 
 ---
 
