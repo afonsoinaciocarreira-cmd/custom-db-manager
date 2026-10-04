@@ -121,7 +121,7 @@ print(response.json())
 ---
 
 ### 3\. JavaScript / Node.js (`fetch`)
-
+```
 async function getData() {
 
 const url \\= "http\\://localhost:8080/select\\\_from/users";
@@ -145,9 +145,9 @@ console.log(data);
 }
 
 getData();
-
+```
 ---
-
+```
 ### 4\. PHP (`cURL`)
 
 \<?php
@@ -173,11 +173,11 @@ curl\_close(\$ch);
 print\_r(json\_decode(\$response, true));
 
 ?\>
-
+```
 ---
 
 ### 5\. Go (`net/http`)
-
+```
 package main
 
 import (
@@ -213,11 +213,11 @@ body, \\\_ := io.ReadAll(resp.Body)
 println(string(body))
 
 }
-
+```
 ---
 
 ### 6\. C\# (`HttpClient`)
-
+```
 using System;
 
 using System.Net.Http;
@@ -247,9 +247,9 @@ static async Task Main()
 }
 
 }
-
+```
 ---
-
+```
 ### 7\. Java (`HttpClient`)
 
 import java.net.URI;
@@ -283,7 +283,7 @@ public static void main(String\\\[\\\] args) throws Exception {
 }
 
 }
-
+```
 ---
 
 ## 📊 Interactive Web Dashboard
