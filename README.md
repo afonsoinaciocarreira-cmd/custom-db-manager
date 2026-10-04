@@ -76,7 +76,7 @@ The system automatically organizes files and secrets in the following structure:
 * **`clear`**: Clears the screen and reloads the main banner.  
 * **`help`**: Displays the interactive help menu.  
 * **`exit` / `quit`**: Exits the CLI application.
-<img width="424" height="141" alt="image" src="https://github.com/user-attachments/assets/39c7f075-1b79-4bac-9486-9dcd452c36ff" />
+<img width="424" height="133" alt="image" src="https://github.com/user-attachments/assets/503c42ec-4f9c-4c5a-b822-b014b21f7801" />
 
 ---
 
