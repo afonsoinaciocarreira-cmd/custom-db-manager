@@ -1,4 +1,4 @@
-# 🚀 Custom DB Manager CLI & API
+# 🚀 Custom DB Manager CLI & API (BETA)
 
 A lightweight database management system written in Shell Script (`/bin/sh`), featuring support for **multiple file-based relational databases**, an **API Key security system**, and an **integrated Python HTTP/HTTPS server** equipped with dynamic RESTful endpoints and an interactive Web control panel.
 
