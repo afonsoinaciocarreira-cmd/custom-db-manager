@@ -147,9 +147,8 @@ console.log(data);
 getData();
 ```
 ---
-```
 ### 4\. PHP (`cURL`)
-
+```
 \<?php
 
 \$url \= "http\://localhost:8080/select\_from/users";
