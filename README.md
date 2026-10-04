@@ -14,23 +14,23 @@ The system automatically organizes files and secrets in the following structure:
 
 .  
 ├── **`mainDir/`**  
-├── **`customdb.sh`** # Main CLI script
+├── **`customdb.sh`** **# Main CLI script**
 
 └── **`db\_manage/`**
 
-├── **`database/`**# Databases directory
+├── **`database/`** **# Databases directory**
 
 │   └── **`\\\<db\\\_name\\\>/`**
 
-│       ├── **`\\\<db\\\_name\\\>`**.db # Metadata and database schema
+│       ├── **`\\\<db\\\_name\\\>.db`** **# Metadata and database schema**
 
-│       ├── **`tables/`** # Corresponding .tbl table files
+│       ├── **`tables/`** **# Corresponding .tbl table files**
 
-│       └── **`api/`** # API configuration, logs, and server files (server.py, api.cfg, api.pid)
+│       └── **`api/`** **# API configuration, logs, and server files (server.py, api.cfg, api.pid)**
 
 └── **`secrets/`**
 
-   └── **`database.cfg`** # Global secret keys configuration file (Secret Keys)
+   └── **`database.cfg`** **# Global secret keys configuration file (Secret Keys)**
    
 ---
 
