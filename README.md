@@ -218,7 +218,7 @@ static async Task Main()
 ```
 `Output:`
 
-link
+<img width="356" height="267" alt="image" src="https://github.com/user-attachments/assets/531f05d2-fbef-404a-81b1-836c25e99ffa" />
 
 ---
 ### 7\. Java (`HttpClient`)
