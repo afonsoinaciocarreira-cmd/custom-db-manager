@@ -195,7 +195,7 @@ println(string(body))
 ```
 `Output:`
 
-<img width="354" height="274" alt="image" src="https://github.com/user-attachments/assets/98303299-d3ad-4a79-bb3c-8473ed4b8a8d" />
+<img width="359" height="272" alt="image" src="https://github.com/user-attachments/assets/3bed819e-80b3-4298-9bee-d9fb4afaefc5" />
 
 ---
 
