@@ -31,6 +31,7 @@ The system automatically organizes files and secrets in the following structure:
 ---
 
 ## 🛠️ CLI Commands & Functional Description
+<img width="414" height="132" alt="image" src="https://github.com/user-attachments/assets/d09dd30a-4220-4131-b281-9b4c5aff40b3" />
 
 ### 📂 Database Management
 
@@ -76,7 +77,6 @@ The system automatically organizes files and secrets in the following structure:
 * **`clear`**: Clears the screen and reloads the main banner.  
 * **`help`**: Displays the interactive help menu.  
 * **`exit` / `quit`**: Exits the CLI application.
-<img width="414" height="132" alt="image" src="https://github.com/user-attachments/assets/d09dd30a-4220-4131-b281-9b4c5aff40b3" />
 
 ---
 
