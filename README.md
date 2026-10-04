@@ -176,39 +176,22 @@ print_r(json_decode($response, true));
 ### 5\. Go (`net/http`)
 ```
 package main
-
 import (
-
 "fmt"
-
 "io"
-
 "net/http"
-
 )
-
 func main() {
-
-client := \\\&http.Client{}
-
-req, \\\_ := http.NewRequest("GET", "http\\://localhost:8080/select\\\_from/users", nil)
-
-req.Header.Add("X-Secret-Key", "your\\\_secret\\\_key")
-
+client := &http.Client{}
+req, _ := http.NewRequest("GET", "http://localhost:8080/select_from/users", nil)
+req.Header.Add("X-Secret-Key", "your_secret_key")
 resp, err := client.Do(req)
-
-if err \\\!= nil {
-
+if err != nil {
 	panic(err)
-
 }
-
 defer resp.Body.Close()
-
-body, \\\_ := io.ReadAll(resp.Body)
-
+body, _ := io.ReadAll(resp.Body)
 println(string(body))
-
 }
 ```
 `Output:`
