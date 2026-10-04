@@ -114,20 +114,16 @@ curl -X GET "http://localhost:8080/select_from/users" \
 ```
 Output:
 
-<img width="394" height="280" alt="image" src="https://github.com/user-attachments/assets/54334592-4edd-4fdd-8347-b600d091965f" />
+<img width="398" height="275" alt="image" src="https://github.com/user-attachments/assets/2f1cadc0-39df-4bcf-95af-c4681c40fdb9" />
 
 ---
 
 ### 2\. Python (`requests`)
 ```
 import requests
-
-url \= "http\://localhost:8080/select\_from/users"
-
-headers \= {"X-Secret-Key": "your\_secret\_key"}
-
-response \= requests.get(url, headers=headers, verify=False)  \# verify=False only for self-signed HTTPS
-
+url = "http://localhost:8080/select_from/users"
+headers = {"X-Secret-Key": "your_secret_key"}
+response = requests.get(url, headers=headers, verify=False) # verify=False only for self-signed HTTPS
 print(response.json())
 ```
 ---
