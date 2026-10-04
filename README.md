@@ -107,9 +107,9 @@ Below are practical examples of how to consume API endpoints (e.g., querying tab
 
 ### 1\. cURL (Command Line)
 ```
-curl \-X GET "http://localhost:8080/select\_from/users" \\
+curl \-X GET "http://localhost:8080/select_from/users" \\
 
- \\-H "X-Secret-Key: your\\\_secret\\\_key"
+ \\-H "X-Secret-Key: your_secret_key"
 
 *(If using **HTTPS** with a self-signed certificate, add the `-k` flag to bypass security warnings).*
 ```
