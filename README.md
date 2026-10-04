@@ -149,7 +149,7 @@ getData();
 ```
 `Output:`
 
-<img width="342" height="201" alt="image" src="https://github.com/user-attachments/assets/26ab92f7-f0e0-43fb-a5c3-4bbfda27caba" />
+<img width="343" height="202" alt="image" src="https://github.com/user-attachments/assets/cf12df17-04c4-469c-adac-e59e3a5b3d05" />
 
 ---
 ### 4\. PHP (`cURL`)
