@@ -8,9 +8,9 @@ A lightweight database management system written in Shell Script (`/bin/sh`), fe
 
 The system automatically organizes files and secrets in the following structure:
 
-.  
 <img width="439" height="29" alt="image" src="https://github.com/user-attachments/assets/bb471967-3b9b-4793-89ae-ca2641e053a7" />
 
+.  
 ├── db\_system/  
 ├── customdb.sh                \# Main CLI script
 
