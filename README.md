@@ -16,13 +16,13 @@ The system automatically organizes files and secrets in the following structure:
 ├── **`mainDir/`**  
 ├── **`customdb.sh`** **# Main CLI script**
 
-└── **`db\_manage/`**
+└── **`db_manage/`**
 
 ├── **`database/`** **# Databases directory**
 
-│   └── **`\\\<db\\\_name\\\>/`**
+│   └── **`<db_name>/`**
 
-│       ├── **`\\\<db\\\_name\\\>.db`** **# Metadata and database schema**
+│       ├── **`<db_name>.db`** **# Metadata and database schema**
 
 │       ├── **`tables/`** **# Corresponding .tbl table files**
 
