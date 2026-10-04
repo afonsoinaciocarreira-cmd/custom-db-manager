@@ -40,6 +40,7 @@ The system automatically organizes files and secrets in the following structure:
 ---
 <img width="562" height="769" alt="image" src="https://github.com/user-attachments/assets/9a174d25-d468-4cac-9de9-34d53e0104b2" />
 
+---
 ### 📂 Database Management
 
 * **`create_database <name>`**: Creates a new database, generating the table structure, metadata, and the internal API server script.  
