@@ -112,7 +112,7 @@ curl -X GET "http://localhost:8080/select_from/users" \
 
 *(If using **HTTPS** with a self-signed certificate, add the `-k` flag to bypass security warnings).*
 ```
-Output:
+`Output:`
 
 <img width="398" height="275" alt="image" src="https://github.com/user-attachments/assets/2f1cadc0-39df-4bcf-95af-c4681c40fdb9" />
 
@@ -126,61 +126,51 @@ headers = {"X-Secret-Key": "your_secret_key"}
 response = requests.get(url, headers=headers, verify=False) # verify=False only for self-signed HTTPS
 print(response.json())
 ```
+`Output:`
+
+link
+
 ---
 
 ### 3\. JavaScript / Node.js (`fetch`)
 ```
 async function getData() {
-
-const url \\= "http\\://localhost:8080/select\\\_from/users";
-
-const response \\= await fetch(url, {
-
+const url = "http://localhost:8080/select_from/users";
+const response = await fetch(url, {
     method: "GET",
-
     headers: {
-
-        "X-Secret-Key": "your\\\_secret\\\_key"
-
+        "X-Secret-Key": "your_secret_key"
     }
-
 });
-
-const data \\= await response.json();
-
+const data = await response.json();
 console.log(data);
-
 }
-
 getData();
 ```
+`Output:`
+
+link
+
 ---
 ### 4\. PHP (`cURL`)
 ```
 \<?php
-
 \$url \= "http\://localhost:8080/select\_from/users";
-
 \$ch \= curl\_init(\$url);
-
 curl\_setopt(\$ch, CURLOPT\_RETURNTRANSFER, true);
-
 curl\_setopt(\$ch, CURLOPT\_HTTPHEADER, \[
-
 "X-Secret-Key: your\\\_secret\\\_key"
-
 \]);
-
 // curl\_setopt(\$ch, CURLOPT\_SSL\_VERIFYPEER, false); // Uncomment if using self-signed HTTPS
-
 \$response \= curl\_exec(\$ch);
-
 curl\_close(\$ch);
-
 print\_r(json\_decode(\$response, true));
-
 ?\>
 ```
+`Output:`
+
+link
+
 ---
 
 ### 5\. Go (`net/http`)
@@ -221,6 +211,10 @@ println(string(body))
 
 }
 ```
+`Output:`
+
+link
+
 ---
 
 ### 6\. C\# (`HttpClient`)
@@ -255,6 +249,10 @@ static async Task Main()
 
 }
 ```
+`Output:`
+
+link
+
 ---
 ### 7\. Java (`HttpClient`)
 ```
@@ -290,6 +288,10 @@ public static void main(String\\\[\\\] args) throws Exception {
 
 }
 ```
+`Output:`
+
+link
+
 ---
 
 ## 📊 Interactive Web Dashboard
