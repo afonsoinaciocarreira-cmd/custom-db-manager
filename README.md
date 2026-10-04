@@ -177,7 +177,6 @@ print_r(json_decode($response, true));
 ```
 package main
 import (
-"fmt"
 "io"
 "net/http"
 )
