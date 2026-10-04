@@ -203,33 +203,18 @@ link
 ### 6\. C\# (`HttpClient`)
 ```
 using System;
-
 using System.Net.Http;
-
 using System.Threading.Tasks;
-
 class Program
-
 {
-
 static async Task Main()
-
 {
-
-    using var client \\= new HttpClient();
-
-    client.DefaultRequestHeaders.Add("X-Secret-Key", "your\\\_secret\\\_key");
-
-    var response \\= await client.GetAsync("http\\://localhost:8080/select\\\_from/users");
-
-    var jsonString \\= await response.Content.ReadAsStringAsync();
-
-    
-
+    using var client = new HttpClient();
+    client.DefaultRequestHeaders.Add("X-Secret-Key", "your_secret_key");
+    var response = await client.GetAsync("http://localhost:8080/select_from/users");
+    var jsonString = await response.Content.ReadAsStringAsync();
     Console.WriteLine(jsonString);
-
 }
-
 }
 ```
 `Output:`
@@ -240,35 +225,20 @@ link
 ### 7\. Java (`HttpClient`)
 ```
 import java.net.URI;
-
 import java.net.http.HttpClient;
-
 import java.net.http.HttpRequest;
-
 import java.net.http.HttpResponse;
-
 public class ApiClient {
-
-public static void main(String\\\[\\\] args) throws Exception {
-
-    HttpClient client \\= HttpClient.newHttpClient();
-
-    HttpRequest request \\= HttpRequest.newBuilder()
-
-        .uri(URI.create("http\\://localhost:8080/select\\\_from/users"))
-
-        .header("X-Secret-Key", "your\\\_secret\\\_key")
-
+public static void main(String[] args) throws Exception {
+    HttpClient client = HttpClient.newHttpClient();
+    HttpRequest request = HttpRequest.newBuilder()
+        .uri(URI.create("http://localhost:8080/select_from/users"))
+        .header("X-Secret-Key", "your_secret_key")
         .GET()
-
         .build();
-
-    HttpResponse\\\<String\\\> response \\= client.send(request, HttpResponse.BodyHandlers.ofString());
-
+    HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
     System.out.println(response.body());
-
 }
-
 }
 ```
 `Output:`
