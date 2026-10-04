@@ -30,7 +30,7 @@ The system automatically organizes files and secrets in the following structure:
 
 └── secrets/
 
-           └── database.cfg    \\\# Global secret keys configuration file (Secret Keys)
+   └── database.cfg    \\\# Global secret keys configuration file (Secret Keys)
 ---
 
 ## 🛠️ CLI Commands & Functional Description
