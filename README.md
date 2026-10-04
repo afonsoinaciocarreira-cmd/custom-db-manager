@@ -112,7 +112,8 @@ curl -X GET "http://localhost:8080/select_from/users" \
 
 *(If using **HTTPS** with a self-signed certificate, add the `-k` flag to bypass security warnings).*
 ```
-<img width="365" height="251" alt="image" src="https://github.com/user-attachments/assets/65d33abc-0630-456d-9fe5-a339fb6ce871" />
+Output:
+<img width="394" height="280" alt="image" src="https://github.com/user-attachments/assets/54334592-4edd-4fdd-8347-b600d091965f" />
 
 ---
 
