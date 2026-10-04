@@ -35,8 +35,8 @@ The system automatically organizes files and secrets in the following structure:
 ---
 
 ## 🛠️ CLI Commands & Functional Description
-<img width="414" height="132" alt="image" src="https://github.com/user-attachments/assets/d15b1fbd-0af4-499a-9277-2f3291988e63" />
 <img width="562" height="769" alt="image" src="https://github.com/user-attachments/assets/9a174d25-d468-4cac-9de9-34d53e0104b2" />
+<img width="414" height="132" alt="image" src="https://github.com/user-attachments/assets/d15b1fbd-0af4-499a-9277-2f3291988e63" />
 
 ### 📂 Database Management
 
