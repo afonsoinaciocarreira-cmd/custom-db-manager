@@ -12,7 +12,7 @@ The system automatically organizes files and secrets in the following structure:
 <img width="249" height="26" alt="image" src="https://github.com/user-attachments/assets/a2091f44-8741-4430-8be4-efd2d6e83777" />
 <img width="485" height="34" alt="image" src="https://github.com/user-attachments/assets/45a044c2-43e4-4270-b708-8290f2a36b15" />
 
-```.  
+.  
 ├── mainDir/  
 ├── customdb.sh                \# Main CLI script
 
@@ -31,7 +31,6 @@ The system automatically organizes files and secrets in the following structure:
 └── secrets/
 
             └── database.cfg    \\\# Global secret keys configuration file (Secret Keys)
-```
 ---
 
 ## 🛠️ CLI Commands & Functional Description
