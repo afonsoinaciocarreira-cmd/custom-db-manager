@@ -128,7 +128,7 @@ print(response.json())
 ```
 `Output:`
 
-<img width="1644" height="33" alt="image" src="https://github.com/user-attachments/assets/e444240d-ce0a-4231-aa64-265708942346" />
+<img width="1640" height="23" alt="image" src="https://github.com/user-attachments/assets/29104f39-2fc6-4ff9-8a71-d120706ac67e" />
 
 ---
 
