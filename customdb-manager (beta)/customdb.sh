@@ -20,7 +20,7 @@ mkdir -p db_manage/database db_manage/secrets
 show_banner() {
     clear
     printf '%b' "${CYAN}==================================================${NC}\n"
-    printf '%b' "${BOLD}        CUSTOM DB MANAGER CLI - Version 1.6.1     ${NC}\n"
+    printf '%b' "${BOLD}        CUSTOM DB MANAGER CLI - Version beta     ${NC}\n"
     printf '%b' "${CYAN}==================================================${NC}\n"
     printf '%b' " Type '${YELLOW}help${NC}' for commands or '${RED}exit${NC}' to quit.\n\n"
 }
