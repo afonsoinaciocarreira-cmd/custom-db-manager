@@ -154,17 +154,17 @@ getData();
 ---
 ### 4\. PHP (`cURL`)
 ```
-\<?php
-\$url \= "http\://localhost:8080/select\_from/users";
-\$ch \= curl\_init(\$url);
-curl\_setopt(\$ch, CURLOPT\_RETURNTRANSFER, true);
-curl\_setopt(\$ch, CURLOPT\_HTTPHEADER, \[
-"X-Secret-Key: your\\\_secret\\\_key"
-\]);
-// curl\_setopt(\$ch, CURLOPT\_SSL\_VERIFYPEER, false); // Uncomment if using self-signed HTTPS
-\$response \= curl\_exec(\$ch);
-curl\_close(\$ch);
-print\_r(json\_decode(\$response, true));
+<?php
+$url = "http://localhost:8080/select_from/users";
+$ch = curl_init(\$url);
+curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+curl_setopt($ch, CURLOPT_HTTPHEADER, [
+"X-Secret-Key: your_secret_key"
+]);
+curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false); // Uncomment if using self-signed HTTPS
+$response = curl_exec($ch);
+curl_close($ch);
+print_r(json_decode($response, true));
 ?\>
 ```
 `Output:`
