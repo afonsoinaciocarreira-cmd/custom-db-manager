@@ -161,7 +161,7 @@ curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
 curl_setopt($ch, CURLOPT_HTTPHEADER, [
 "X-Secret-Key: your_secret_key"
 ]);
-curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false); // Uncomment if using self-signed HTTPS
+// curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false); // Uncomment if using self-signed HTTPS
 $response = curl_exec($ch);
 curl_close($ch);
 print_r(json_decode($response, true));
