@@ -156,7 +156,7 @@ getData();
 ```
 <?php
 $url = "http://localhost:8080/select_from/users";
-$ch = curl_init(\$url);
+$ch = curl_init($url);
 curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
 curl_setopt($ch, CURLOPT_HTTPHEADER, [
 "X-Secret-Key: your_secret_key"
@@ -165,11 +165,11 @@ curl_setopt($ch, CURLOPT_HTTPHEADER, [
 $response = curl_exec($ch);
 curl_close($ch);
 print_r(json_decode($response, true));
-?\>
+?>
 ```
 `Output:`
 
-link
+<img width="444" height="393" alt="image" src="https://github.com/user-attachments/assets/331ee9c6-5998-4440-a817-1326b77f044b" />
 
 ---
 
