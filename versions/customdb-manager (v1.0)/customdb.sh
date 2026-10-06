@@ -94,6 +94,11 @@ class DBAPIHandler(http.server.BaseHTTPRequestHandler):
         try:
             os.makedirs(TABLES_DIR, exist_ok=True)
 
+            # Restrições da API: Impedir uso de comandos api_* e de database management (menos dump_db)
+            if path.startswith("/api_") or path in ["/show_databases", "/create_database", "/drop_database", "/use"] or path.startswith("/describe/") or path.startswith("/create_database/") or path.startswith("/drop_database/"):
+                status_code = 403
+                raise ValueError(f"Error: API restriction - Endpoint '{path}' is strictly prohibited.")
+
             if path in ["/", "/status"]:
                 tables = [f[:-4] for f in os.listdir(TABLES_DIR) if f.endswith(".tbl")] if os.path.exists(TABLES_DIR) else []
                 response_data.update({
@@ -104,6 +109,19 @@ class DBAPIHandler(http.server.BaseHTTPRequestHandler):
                 if "text/html" in accept_header or path == "/":
                     self._send_html_response(status_code, response_data)
                     return
+
+            elif path == "/dump_db":
+                metadata = ""
+                db_file = os.path.join(DB_PATH, f"{DB_NAME}.db")
+                if os.path.exists(db_file):
+                    with open(db_file, "r") as f:
+                        metadata = f.read()
+                tables = [f[:-4] for f in os.listdir(TABLES_DIR) if f.endswith(".tbl")] if os.path.exists(TABLES_DIR) else []
+                response_data.update({
+                    "message": f"Universal database dump for '{DB_NAME}'.",
+                    "metadata": json.loads(metadata) if metadata.startswith("{") else metadata,
+                    "tables": tables
+                })
 
             elif path == "/show_databases":
                 dbs = []
@@ -1041,83 +1059,99 @@ EOF
                     addr="${api_addr_val:-localhost}"
                     port="${api_port_val:-8080}"
                     
-                    # Traduzir o comando CLI inserido para o respetivo endpoint e método HTTP
                     set -- $args
                     sub_cmd="$1"
                     shift
                     sub_args="$*"
                     
-                    endpoint=""
-                    http_method="GET"
-                    json_body=""
-
+                    api_blocked=0
                     case "$sub_cmd" in
-                        "show_databases")
-                            endpoint="/show_databases"
+                        api_*)
+                            printf '%b' "${RED}Error: API restriction - Use of 'api_*' commands is prohibited via API.${NC}\n"
+                            api_blocked=1
                             ;;
-                        "show_tables")
-                            endpoint="/show_tables"
-                            ;;
-                        "api_status")
-                            endpoint="/status"
-                            ;;
-                        "describe")
-                            endpoint="/describe/$sub_args"
-                            ;;
-                        "create_table")
-                            http_method="POST"
-                            endpoint="/create_table/$sub_args"
-                            ;;
-                        "drop_table")
-                            http_method="DELETE"
-                            endpoint="/drop_table/$sub_args"
-                            ;;
-                        "select_from")
-                            endpoint="/select_from/$sub_args"
-                            ;;
-                        "insert_into")
-                            http_method="POST"
-                            set -- $sub_args
-                            tbl="$1"
-                            shift
-                            data="$*"
-                            endpoint="/insert_into/$tbl"
-                            json_body="{\"data\": \"$data\"}"
-                            ;;
-                        "delete_from")
-                            http_method="DELETE"
-                            endpoint="/delete_from/$sub_args"
-                            ;;
-                        "delete_record")
-                            http_method="DELETE"
-                            set -- $sub_args
-                            tbl="$1"
-                            shift
-                            val="$*"
-                            encoded_val=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1]))" "$val")
-                            endpoint="/delete_record/$tbl/$encoded_val"
-                            ;;
-                        *)
-                            endpoint="/$sub_cmd"
-                            [ -n "$sub_args" ] && endpoint="/$sub_cmd/$sub_args"
+                        create_database|drop_database|use|show_databases|describe)
+                            printf '%b' "${RED}Error: API restriction - Database management command '$sub_cmd' is prohibited via API (only 'dump_db' is allowed).${NC}\n"
+                            api_blocked=1
                             ;;
                     esac
 
-                    url="$proto://$addr:$port$endpoint"
-                    printf '%b' "${YELLOW}Executing via API [$http_method $url]...${NC}\n"
-                    
-                    if command -v curl >/dev/null 2>&1; then
-                        curl_opts="-s"
-                        [ "$proto" = "https" ] && curl_opts="-s -k" # -k ignora certificados autoassinados por conveniência
+                    if [ "$api_blocked" -eq 0 ]; then
+                        endpoint=""
+                        http_method="GET"
+                        json_body=""
+
+                        case "$sub_cmd" in
+                            "dump_db")
+                                endpoint="/dump_db"
+                                ;;
+                            "show_databases")
+                                endpoint="/show_databases"
+                                ;;
+                            "show_tables")
+                                endpoint="/show_tables"
+                                ;;
+                            "api_status")
+                                endpoint="/status"
+                                ;;
+                            "describe")
+                                endpoint="/describe/$sub_args"
+                                ;;
+                            "create_table")
+                                http_method="POST"
+                                endpoint="/create_table/$sub_args"
+                                ;;
+                            "drop_table")
+                                http_method="DELETE"
+                                endpoint="/drop_table/$sub_args"
+                                ;;
+                            "select_from")
+                                endpoint="/select_from/$sub_args"
+                                ;;
+                            "insert_into")
+                                http_method="POST"
+                                set -- $sub_args
+                                tbl="$1"
+                                shift
+                                data="$*"
+                                endpoint="/insert_into/$tbl"
+                                json_body="{\"data\": \"$data\"}"
+                                ;;
+                            "delete_from")
+                                http_method="DELETE"
+                                endpoint="/delete_from/$sub_args"
+                                ;;
+                            "delete_record")
+                                http_method="DELETE"
+                                set -- $sub_args
+                                tbl="$1"
+                                shift
+                                val="$*"
+                                encoded_val=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1]))" "$val")
+                                endpoint="/delete_record/$tbl/$encoded_val"
+                                ;;
+                            *)
+                                endpoint="/$sub_cmd"
+                                [ -n "$sub_args" ] && endpoint="/$sub_cmd/$sub_args"
+                                ;;
+                        esac
+
+                        url="$proto://$addr:$port$endpoint"
+                        printf '%b' "${YELLOW}Executing via API [$http_method $url]...${NC}\n"
                         
-                        if [ -n "$json_body" ]; then
-                            curl $curl_opts -X "$http_method" -H "X-Secret-Key: $api_secret_val" -H "Content-Type: application/json" -d "$json_body" "$url"
+                        if command -v curl >/dev/null 2>&1; then
+                            curl_opts="-s"
+                            [ "$proto" = "https" ] && curl_opts="-s -k"
+                            
+                            if [ -n "$json_body" ]; then
+                                curl $curl_opts -X "$http_method" -H "X-Secret-Key: $api_secret_val" -H "Content-Type: application/json" -d "$json_body" "$url"
+                            else
+                                curl $curl_opts -X "$http_method" -H "X-Secret-Key: $api_secret_val" "$url"
+                            fi
+                            echo ""
                         else
-                            curl $curl_opts -X "$http_method" -H "X-Secret-Key: $api_secret_val" "$url"
+                            printf '%b' "${RED}Error: 'curl' is required to send API requests in this environment.${NC}\n"
                         fi
-                        echo ""
-                    else
-                        printf '%b' "${RED}Error: 'curl' is required to send API requests in this environment.${NC}\n"
                     fi
                 fi
             fi
