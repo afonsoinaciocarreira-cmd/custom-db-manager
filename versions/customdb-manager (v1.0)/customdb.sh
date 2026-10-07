@@ -16,6 +16,8 @@ mkdir -p db_manage/database db_manage/secrets backups
 [ -e "db_manage/secrets/secrets.env" ] || touch "db_manage/secrets/secrets.env"
 [ -e "db_manage/secrets/database.cfg" ] || touch "db_manage/secrets/database.cfg"
 [ -e "db_manage/secrets/api.cfg" ] || touch "db_manage/secrets/api.cfg"
+[ -e "db_manage/secrets/backup_configs.cfg" ] || touch "db_manage/secrets/backup_configs.cfg"
+[ -e "db_manage/secrets/backup_schedule.cfg" ] || touch "db_manage/secrets/backup_schedule.cfg"
 
 show_banner() {
     clear
@@ -41,6 +43,7 @@ SECRET_KEY = os.environ.get("API_SECRET", "default_secret")
 DB_NAME = os.environ.get("DB_NAME", "db")
 PROTOCOL = os.environ.get("API_PROTOCOL", "http")
 API_TYPE = os.environ.get("API_TYPE", "public")
+API_DEBUG = os.environ.get("API_DEBUG", "true").lower() == "true"
 CERT_FILE = os.environ.get("API_CERT", "")
 KEY_FILE = os.environ.get("API_KEY", "")
 
@@ -93,18 +96,21 @@ class DBAPIHandler(http.server.BaseHTTPRequestHandler):
             current_time = time.time()
             REQUEST_TIMESTAMPS[client_ip] = [t for t in REQUEST_TIMESTAMPS[client_ip] if current_time - t < 5.0]
             if len(REQUEST_TIMESTAMPS[client_ip]) >= 10:
-                self._send_response(429, {
+                err_data = {
                     "status": "error",
                     "database": DB_NAME,
-                    "api_type": API_TYPE,
                     "endpoint": urllib.parse.urlparse(self.path).path,
-                    "error": "Limite de requisições excedido. Por favor, tente novamente mais tarde."
-                })
+                    "error": "Rate limit exceeded."
+                }
+                if API_DEBUG:
+                    err_data["api_type"] = API_TYPE
+                self._send_response(429, err_data)
                 return
             REQUEST_TIMESTAMPS[client_ip].append(current_time)
 
         if API_TYPE == "secret" and not self._check_auth():
-            self._send_response(401, {"status": "error", "error": "Unauthorized"})
+            err_data = {"status": "error", "error": "Unauthorized"}
+            self._send_response(401, err_data)
             return
 
         parsed_path = urllib.parse.urlparse(self.path)
@@ -122,7 +128,9 @@ class DBAPIHandler(http.server.BaseHTTPRequestHandler):
                     body_data = {"raw_body": body_bytes.decode('utf-8', errors='ignore')}
 
         params = {**query_params, **body_data}
-        response_data = {"status": "success", "database": DB_NAME, "api_type": API_TYPE, "method": method, "endpoint": path, "protocol": PROTOCOL}
+        response_data = {"status": "success", "database": DB_NAME, "method": method, "endpoint": path, "protocol": PROTOCOL}
+        if API_DEBUG:
+            response_data["api_type"] = API_TYPE
         status_code = 200
 
         try:
@@ -135,7 +143,7 @@ class DBAPIHandler(http.server.BaseHTTPRequestHandler):
             if path in ["/", "/status"]:
                 tables = [f[:-4] for f in os.listdir(TABLES_DIR) if f.endswith(".tbl")] if os.path.exists(TABLES_DIR) else []
                 response_data.update({
-                    "message": f"Real database API server is running.",
+                    "message": "Real database API server is running.",
                     "tables": tables
                 })
                 accept_header = self.headers.get("Accept", "")
@@ -292,19 +300,24 @@ class DBAPIHandler(http.server.BaseHTTPRequestHandler):
             response_data = {
                 "status": "error",
                 "database": DB_NAME,
-                "api_type": API_TYPE,
                 "endpoint": path,
                 "error": str(e)
             }
+            if API_DEBUG:
+                response_data["api_type"] = API_TYPE
 
         self._send_response(status_code, response_data)
 
     def _send_response(self, code, data):
         if isinstance(data, dict):
-            if "message" in data:
-                data["message"] = f"{data['message']} - Powered by Afonso Carreira.Inc"
+            if API_DEBUG:
+                if "message" in data:
+                    data["message"] = f"{data['message']} - Powered by Afonso Carreira.Inc"
+                else:
+                    data["message"] = "Powered by Afonso Carreira.Inc"
             else:
-                data["message"] = "Powered by Afonso Carreira.Inc"
+                if "api_type" in data:
+                    del data["api_type"]
         body = json.dumps(data, indent=2).encode('utf-8')
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
@@ -313,6 +326,8 @@ class DBAPIHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _send_html_response(self, code, data):
+        footer_html = '<div class="footer">Powered by Afonso Carreira.Inc</div>' if API_DEBUG else ''
+        api_type_html = f'<p><strong>API Type:</strong> <code>{API_TYPE.upper()}</code></p>' if API_DEBUG else ''
         html_content = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -333,7 +348,7 @@ class DBAPIHandler(http.server.BaseHTTPRequestHandler):
     <div class="container">
         <h1>Database Server Dashboard <span>{DB_NAME}</span></h1>
         <div class="status-box">✓ Real API Server Active & Responding Live</div>
-        <p><strong>API Type:</strong> <code>{API_TYPE.upper()}</code></p>
+        {api_type_html}
         <p><strong>Protocol:</strong> <code>{PROTOCOL.upper()}</code></p>
         <h3>Active Database Tables:</h3>
         <ul>
@@ -341,7 +356,7 @@ class DBAPIHandler(http.server.BaseHTTPRequestHandler):
         </ul>
         <h3>Real Server Response Output (JSON):</h3>
         <pre>{json.dumps(data, indent=2)}</pre>
-        <div class="footer">Powered by Afonso Carreira.Inc</div>
+        {footer_html}
     </div>
 </body>
 </html>
@@ -366,6 +381,56 @@ if __name__ == "__main__":
 EOF
 }
 
+generate_backup_server_script() {
+    backup_server_script="$1"
+    cat << 'EOF' > "$backup_server_script"
+import os
+import time
+import subprocess
+import sys
+import glob
+
+FUNC_NAME = sys.argv[1] if len(sys.argv) > 1 else "backup"
+INTERVAL = float(sys.argv[2]) if len(sys.argv) > 2 else 300
+LOG_FILE = os.path.join("db_manage", "secrets", "backup_schedule.log")
+
+while True:
+    time.sleep(INTERVAL)
+    timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+    os.makedirs("backups", exist_ok=True)
+    if FUNC_NAME == "backup":
+        bname = f"auto-{timestamp}"
+        subprocess.run(["tar", "-czf", f"backups/{bname}.tar.gz", "db_manage"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    elif FUNC_NAME == "backup_delete":
+        config_file = os.path.join("db_manage", "secrets", "backup_configs.cfg")
+        max_backups = 10
+        if os.path.exists(config_file):
+            try:
+                with open(config_file, "r") as cf:
+                    in_retention = False
+                    for line in cf:
+                        line = line.strip()
+                        if line == "[Retention]":
+                            in_retention = True
+                            continue
+                        elif line.startswith("[") and line.endswith("]"):
+                            in_retention = False
+                        if in_retention and line.startswith("max_backups="):
+                            max_backups = int(line.split("=")[1].strip())
+            except Exception:
+                pass
+        backup_files = sorted(glob.glob(os.path.join("backups", "*.tar.gz")), key=os.path.getmtime)
+        while len(backup_files) > max_backups:
+            oldest = backup_files.pop(0)
+            try:
+                os.remove(oldest)
+            except Exception:
+                pass
+    with open(LOG_FILE, "a") as f:
+        f.write(f"{time.ctime()}: Automated backup function '{FUNC_NAME}' executed successfully (PID: {os.getpid()})\n")
+EOF
+}
+
 init_permissions_file() {
     perm_file="$1"
     if [ ! -f "$perm_file" ]; then
@@ -385,6 +450,62 @@ update=false
 rename_table=false
 EOF
     fi
+}
+
+init_backup_configs_file() {
+    cfg_file="$1"
+    if [ ! -f "$cfg_file" ] || [ ! -s "$cfg_file" ]; then
+        cat << EOF > "$cfg_file"
+[General]
+default_backup_name=auto
+auto_compression=true
+verify_integrity=false
+[Retention]
+max_backups=10
+auto_cleanup=false
+keep_daily=false
+keep_weekly=false
+[Schedule]
+default_interval=1h
+background_daemon=true
+notify_on_completion=false
+[Security]
+encrypt_backups=false
+storage_permissions=700
+sign_manifest=false
+EOF
+    fi
+}
+
+init_backup_configs_file "db_manage/secrets/backup_configs.cfg"
+
+init_backup_schedule_file() {
+    s_file="$1"
+    if [ ! -f "$s_file" ] || [ ! -s "$s_file" ]; then
+        cat << EOF > "$s_file"
+backup=false:1h
+backup_delete=false:1d
+EOF
+    fi
+}
+
+init_backup_schedule_file "db_manage/secrets/backup_schedule.cfg"
+
+parse_interval() {
+    val="$1"
+    num=$(echo "$val" | sed 's/[^0-9]*//g')
+    unit=$(echo "$val" | sed 's/[0-9]*//g')
+    [ -z "$num" ] && num="300"
+    case "$unit" in
+        sec) secs="$num" ;;
+        min) secs=$(expr "$num" \* 60) ;;
+        h) secs=$(expr "$num" \* 3600) ;;
+        d) secs=$(expr "$num" \* 86400) ;;
+        w) secs=$(expr "$num" \* 604800) ;;
+        y) secs=$(expr "$num" \* 31536000) ;;
+        *) secs="$num" ;;
+    esac
+    echo "$secs"
 }
 
 print_professional_table() {
@@ -469,23 +590,6 @@ confirm_action() {
     fi
 }
 
-parse_interval() {
-    val="$1"
-    num=$(echo "$val" | sed 's/[^0-9]*//g')
-    unit=$(echo "$val" | sed 's/[0-9]*//g')
-    [ -z "$num" ] && num="300"
-    case "$unit" in
-        sec) secs="$num" ;;
-        min) secs=$(expr "$num" \* 60) ;;
-        h) secs=$(expr "$num" \* 3600) ;;
-        d) secs=$(expr "$num" \* 86400) ;;
-        w) secs=$(expr "$num" \* 604800) ;;
-        y) secs=$(expr "$num" \* 31536000) ;;
-        *) secs="$num" ;;
-    esac
-    echo "$secs"
-}
-
 show_banner
 
 while true; do
@@ -553,8 +657,10 @@ while true; do
                 printf '%b' " ${YELLOW}[ 📦 BACKUP MANAGEMENT ]${NC}\n"
                 printf '%b' "   ${CYAN}backup <name> [--force]${NC}           ${GRAY}- Create a file structure backup${NC}\n"
                 printf '%b' "   ${CYAN}backups${NC}                           ${GRAY}- List all backups professionally${NC}\n"
-                printf '%b' "   ${CYAN}backup-restore <name> [--force]${NC}   ${GRAY}- Restore from backup${NC}\n"
-                printf '%b' "   ${CYAN}backup_auto <true|false> <val>${NC}    ${GRAY}- Automate backups (e.g. 10min, 1h)${NC}\n\n"
+                printf '%b' "   ${CYAN}backup_restore <name> [--force]${NC}   ${GRAY}- Restore from backup${NC}\n"
+                printf '%b' "   ${CYAN}backup_delete <name> [--force]${NC}    ${GRAY}- Delete a backup file${NC}\n"
+                printf '%b' "   ${CYAN}backup_schedule <func> <true|false> <val>${NC} ${GRAY}- Automate backup functions${NC}\n"
+                printf '%b' "   ${CYAN}backup_configs <cfg> <val>${NC}      ${GRAY}- Show/Configure backup categories${NC}\n\n"
                 printf '%b' " ${YELLOW}[ 🛠 SYSTEM ]${NC}\n"
                 printf '%b' "   ${CYAN}clear${NC}                             ${GRAY}- Clear screen${NC}\n"
                 printf '%b' "   ${CYAN}help${NC}                              ${GRAY}- Show help menu${NC}\n"
@@ -569,7 +675,14 @@ while true; do
                 bname="$1"
                 force_arg="$2"
                 [ "$bname" = "--force" ] && { force_arg="--force"; bname=""; }
-                [ -z "$bname" ] && bname="$(date +%Y-%m-%d_%H-%M-%S)"
+                if [ -z "$bname" ]; then
+                    def_prefix="auto"
+                    if [ -f "db_manage/secrets/backup_configs.cfg" ]; then
+                        val=$(grep "^default_backup_name=" "db_manage/secrets/backup_configs.cfg" 2>/dev/null | cut -d'=' -f2 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                        [ -n "$val" ] && def_prefix="$val"
+                    fi
+                    bname="${def_prefix}-$(date +%Y-%m-%d_%H-%M-%S)"
+                fi
                 
                 bfile="backups/$bname.tar.gz"
                 if [ -e "$bfile" ]; then
@@ -611,12 +724,12 @@ else:
 '
                 echo ""
                 ;;
-            "backup-restore")
+            "backup_restore")
                 set -- $args
                 bname="$1"
                 force_arg="$2"
                 if [ -z "$bname" ]; then
-                    printf '%b' "${RED}Error: Backup name required. Usage: backup-restore <backup-name> [--force]${NC}\n"
+                    printf '%b' "${RED}Error: Backup name required. Usage: backup_restore <backup-name> [--force]${NC}\n"
                 else
                     bfile="backups/$bname.tar.gz"
                     if [ ! -e "$bfile" ]; then
@@ -626,39 +739,172 @@ else:
                             echo ""
                             continue
                         fi
+                        for db_dir in db_manage/database/*; do
+                            [ -d "$db_dir" ] || continue
+                            for api_type in public secret; do
+                                pid_file="$db_dir/api/$api_type/api.pid"
+                                if [ -f "$pid_file" ]; then
+                                    pid=$(cat "$pid_file" 2>/dev/null)
+                                    [ -n "$pid" ] && kill "$pid" 2>/dev/null
+                                    rm -f "$pid_file"
+                                fi
+                            done
+                        done
+                        for pid_file in db_manage/secrets/backup_*.pid; do
+                            [ -f "$pid_file" ] || continue
+                            pid=$(cat "$pid_file" 2>/dev/null)
+                            [ -n "$pid" ] && kill "$pid" 2>/dev/null
+                            rm -f "$pid_file"
+                        done
+                        pkill -f "python3.*server.py" 2>/dev/null
                         tar -xzf "$bfile" 2>/dev/null
-                        printf '%b' "${GREEN}Backup '$bname' restored successfully.${NC}\n"
+                        printf '%b' "${GREEN}Todos os servidores Python foram encerrados e o backup '$bname' foi restaurado com sucesso.${NC}\n"
                     fi
                 fi
                 echo ""
                 ;;
-            "backup_auto")
+            "backup_delete")
                 set -- $args
-                status="$1"
-                val="$2"
-                if [ -z "$status" ]; then
-                    printf '%b' "${RED}Error: Usage: backup_auto <true/false> <value>${NC}\n"
-                elif [ "$status" = "true" ]; then
-                    [ -z "$val" ] && val="1h"
-                    secs=$(parse_interval "$val")
-                    [ -f "db_manage/secrets/backup_auto.pid" ] && kill "$(cat db_manage/secrets/backup_auto.pid)" 2>/dev/null
-                    (
-                        while true; do
-                            sleep "$secs"
-                            bname="auto-$(date +%Y-%m-%d_%H-%M-%S)"
-                            mkdir -p backups
-                            tar -czf "backups/$bname.tar.gz" db_manage 2>/dev/null
-                            echo "$(date): Auto backup '$bname' created successfully." >> "db_manage/secrets/backup_auto.log"
-                        done
-                    ) &
-                    echo $! > "db_manage/secrets/backup_auto.pid"
-                    printf '%b' "${GREEN}Automatic backup enabled successfully with interval $val.${NC}\n"
-                elif [ "$status" = "false" ]; then
-                    [ -f "db_manage/secrets/backup_auto.pid" ] && kill "$(cat db_manage/secrets/backup_auto.pid)" 2>/dev/null
-                    rm -f "db_manage/secrets/backup_auto.pid"
-                    printf '%b' "${GREEN}Automatic backup disabled successfully.${NC}\n"
+                bname="$1"
+                force_arg="$2"
+                if [ -z "$bname" ]; then
+                    printf '%b' "${RED}Error: Backup name required. Usage: backup_delete <backup-name> [--force]${NC}\n"
                 else
-                    printf '%b' "${RED}Error: First argument must be 'true' or 'false'.${NC}\n"
+                    bfile="backups/$bname.tar.gz"
+                    if [ ! -e "$bfile" ]; then
+                        printf '%b' "${RED}Error: Backup '$bname' does not exist.${NC}\n"
+                    else
+                        if ! confirm_action "$force_arg" "Delete backup '$bname'"; then
+                            echo ""
+                            continue
+                        fi
+                        rm -f "$bfile"
+                        printf '%b' "${GREEN}Backup '$bname' deleted successfully.${NC}\n"
+                    fi
+                fi
+                echo ""
+                ;;
+            "backup_configs")
+                cfg_file="db_manage/secrets/backup_configs.cfg"
+                init_backup_configs_file "$cfg_file"
+                set -- $args
+                c_key="$1"
+                c_val="$2"
+                if [ -z "$c_key" ]; then
+                    printf '%b' "${CYAN}${BOLD}Categorized Backup System Configurations:${NC}\n"
+                    curr_cat=""
+                    while IFS='=' read -r k v || [ -n "$k" ]; do
+                        k=$(echo "$k" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/\r//g')
+                        v=$(echo "$v" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/\r//g')
+                        case "$k" in
+                            \[*\])
+                                curr_cat="$k"
+                                printf '%b' "\n  ${YELLOW}${curr_cat}${NC}\n"
+                                ;;
+                            *=*)
+                                [ -n "$k" ] && printf '%b' "    - ${CYAN}$k${NC}: ${GREEN}$v${NC}\n"
+                                ;;
+                            *)
+                                if [ -n "$k" ] && [ -n "$v" ]; then
+                                    printf '%b' "    - ${CYAN}$k${NC}: ${GREEN}$v${NC}\n"
+                                fi
+                                ;;
+                        esac
+                    done < "$cfg_file"
+                elif [ -n "$c_key" ] && [ -z "$c_val" ]; then
+                    printf '%b' "${RED}Error: Missing configuration value. Usage: backup_configs <cfg> <val>${NC}\n"
+                else
+                    temp_f="$cfg_file.tmp"
+                    found_c=0
+                    while IFS='=' read -r k v || [ -n "$k" ]; do
+                        case "$k" in
+                            \[*\])
+                                echo "$k" >> "$temp_f"
+                                ;;
+                            *)
+                                parts_k=$(echo "$k" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                                if [ "$parts_k" = "$c_key" ]; then
+                                    echo "$k=$c_val" >> "$temp_f"
+                                    found_c=1
+                                else
+                                    [ -n "$k" ] && echo "$k=$v" >> "$temp_f"
+                                fi
+                                ;;
+                        esac
+                    done < "$cfg_file"
+                    mv "$temp_f" "$cfg_file"
+                    if [ "$found_c" -eq 1 ]; then
+                        printf '%b' "${GREEN}Backup configuration '$c_key' updated successfully to '$c_val'.${NC}\n"
+                    else
+                        printf '%b' "${RED}Error: Backup configuration key '$c_key' does not exist.${NC}\n"
+                    fi
+                fi
+                echo ""
+                ;;
+            "backup_schedule")
+                s_file="db_manage/secrets/backup_schedule.cfg"
+                init_backup_schedule_file "$s_file"
+                set -- $args
+                s_func="$1"
+                s_status="$2"
+                s_val="$3"
+
+                if [ -z "$s_func" ]; then
+                    printf '%b' "${CYAN}${BOLD}Backup Schedule Functions:${NC}\n"
+                    while IFS='=' read -r k v || [ -n "$k" ]; do
+                        [ -z "$k" ] && continue
+                        fn_name="$k"
+                        fn_status_val=$(echo "$v" | cut -d':' -f1)
+                        fn_interval=$(echo "$v" | cut -d':' -f2)
+                        pid_file="db_manage/secrets/backup_${fn_name}.pid"
+                        pid_val="${RED}Stopped${NC}"
+                        if [ -f "$pid_file" ]; then
+                            p=$(cat "$pid_file" 2>/dev/null)
+                            if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+                                pid_val="${GREEN}PID: $p${NC}"
+                            else
+                                rm -f "$pid_file"
+                            fi
+                        fi
+                        printf '%b' "  - ${CYAN}${fn_name}${NC} -> Status: ${YELLOW}${fn_status_val}${NC}, Interval: ${BLUE}${fn_interval}${NC}, Process: ${pid_val}\n"
+                    done < "$s_file"
+                elif [ -n "$s_func" ] && [ -z "$s_status" ]; then
+                    printf '%b' "${RED}Error: Missing status. Usage: backup_schedule <function> <true|false> [interval]${NC}\n"
+                elif [ "$s_status" != "true" ] && [ "$s_status" != "false" ]; then
+                    printf '%b' "${RED}Error: Status must be 'true' or 'false'.${NC}\n"
+                else
+                    [ -z "$s_val" ] && s_val="1h"
+                    temp_f="$s_file.tmp"
+                    found_s=0
+                    while IFS='=' read -r k v || [ -n "$k" ]; do
+                        [ -z "$k" ] && continue
+                        if [ "$k" = "$s_func" ]; then
+                            echo "$k=$s_status:$s_val" >> "$temp_f"
+                            found_s=1
+                        else
+                            echo "$k=$v" >> "$temp_f"
+                        fi
+                    done < "$s_file"
+                    mv "$temp_f" "$s_file"
+
+                    pid_file="db_manage/secrets/backup_${s_func}.pid"
+                    if [ -f "$pid_file" ]; then
+                        p=$(cat "$pid_file" 2>/dev/null)
+                        [ -n "$p" ] && kill "$p" 2>/dev/null
+                        rm -f "$pid_file"
+                    fi
+
+                    if [ "$s_status" = "true" ]; then
+                        secs=$(parse_interval "$s_val")
+                        server_script="db_manage/secrets/backup_server.py"
+                        [ ! -f "$server_script" ] && generate_backup_server_script "$server_script"
+                        nohup python3 "$server_script" "$s_func" "$secs" > "db_manage/secrets/backup_${s_func}.log" 2>&1 &
+                        echo $! > "$pid_file"
+                        disown $! 2>/dev/null
+                        printf '%b' "${GREEN}Backup function '$s_func' scheduled successfully with interval $s_val.${NC}\n"
+                    else
+                        printf '%b' "${GREEN}Backup function '$s_func' disabled successfully.${NC}\n"
+                    fi
                 fi
                 echo ""
                 ;;
@@ -887,35 +1133,39 @@ else:
                 else
                     set -- $args
                     tbl_name="$1"
-                    shift
-                    if [ -z "$tbl_name" ] || [ $# -eq 0 ]; then
+                    if [ -z "$tbl_name" ]; then
                         printf '%b' "${RED}Error: Usage: create_column <tbl> <col>${NC}\n"
                     elif [ ! -e "db_manage/database/${CURRENT_DB}/tables/$tbl_name.tbl" ]; then
                         printf '%b' "${RED}Error: Table '$tbl_name' does not exist.${NC}\n"
                     else
-                        tbl_file="db_manage/database/${CURRENT_DB}/tables/$tbl_name.tbl"
-                        for col_name in "$@"; do
-                            col_name=$(echo "$col_name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                            [ -z "$col_name" ] && continue
-                            if [ ! -s "$tbl_file" ]; then
-                                echo "$col_name" > "$tbl_file"
-                                printf '%b' "${GREEN}Column '$col_name' added to table '$tbl_name'.${NC}\n"
-                            else
-                                tmp_file="$tbl_file.tmp"
-                                rm -f "$tmp_file"
-                                first_line=1
-                                while IFS= read -r line || [ -n "$line" ]; do
-                                    if [ "$first_line" -eq 1 ]; then
-                                        echo "$line | $col_name" >> "$tmp_file"
-                                        first_line=0
-                                    else
-                                        echo "$line | " >> "$tmp_file"
-                                    fi
-                                done < "$tbl_file"
-                                mv "$tmp_file" "$tbl_file"
-                                printf '%b' "${GREEN}Column '$col_name' added to table '$tbl_name'.${NC}\n"
-                            fi
-                        done
+                        shift
+                        if [ $# -eq 0 ]; then
+                            printf '%b' "${RED}Error: Column name required.${NC}\n"
+                        else
+                            tbl_file="db_manage/database/${CURRENT_DB}/tables/$tbl_name.tbl"
+                            for col_name in "$@"; do
+                                col_name=$(echo "$col_name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                                [ -z "$col_name" ] && continue
+                                if [ ! -s "$tbl_file" ]; then
+                                    echo "$col_name" > "$tbl_file"
+                                    printf '%b' "${GREEN}Column '$col_name' added to table '$tbl_name'.${NC}\n"
+                                else
+                                    tmp_file="$tbl_file.tmp"
+                                    rm -f "$tmp_file"
+                                    first_line=1
+                                    while IFS= read -r line || [ -n "$line" ]; do
+                                        if [ "$first_line" -eq 1 ]; then
+                                            echo "$line | $col_name" >> "$tmp_file"
+                                            first_line=0
+                                        else
+                                            echo "$line | " >> "$tmp_file"
+                                        fi
+                                    done < "$tbl_file"
+                                    mv "$tmp_file" "$tbl_file"
+                                    printf '%b' "${GREEN}Column '$col_name' added to table '$tbl_name'.${NC}\n"
+                                fi
+                            done
+                        fi
                     fi
                 fi
                 echo ""
@@ -949,10 +1199,7 @@ else:
                 if [ "$CURRENT_DB" = "none" ]; then
                     printf '%b' "${RED}Error: No active database. Use 'use <name>' first.${NC}\n"
                 else
-                    OLD_IFS="$IFS"
-                    IFS='&'
                     set -- $args
-                    IFS="$OLD_IFS"
                     tbl_name="$1"
                     old_col="$2"
                     new_col="$3"
@@ -1084,15 +1331,11 @@ print("└" + "─" * (max_len + 4) + "┘")
                         
                         set -- $item
                         tblname="$1"
-                        shift
-                        param1="$1"
-                        shift
-                        rest_params="$*"
-                        
                         if [ -z "$tblname" ]; then
                             printf '%b' "${RED}Error: Table name required.${NC}\n"
                             continue
                         fi
+                        shift
                         
                         tbl_file="db_manage/database/${CURRENT_DB}/tables/$tblname.tbl"
                         if [ ! -e "$tbl_file" ]; then
@@ -1100,56 +1343,50 @@ print("└" + "─" * (max_len + 4) + "┘")
                             continue
                         fi
                         
-                        if [ -n "$rest_params" ]; then
-                            col_name="$param1"
-                            val="$rest_params"
-                            header=$(head -n 1 "$tbl_file")
-                            col_idx=-1
-                            curr_idx=1
-                            OLD_IFS2="$IFS"
-                            IFS='|'
-                            set -- $header
-                            IFS="$OLD_IFS2"
-                            for col in "$@"; do
-                                col=$(echo "$col" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                                if [ "$col" = "$col_name" ]; then
-                                    col_idx="$curr_idx"
-                                    break
-                                fi
-                                curr_idx=$(expr "$curr_idx" + 1)
-                            done
-                            
-                            if [ "$col_idx" -eq -1 ]; then
-                                printf '%b' "${RED}Error: Column '$col_name' does not exist.${NC}\n"
-                            else
-                                total_cols=1
-                                if [ -s "$tbl_file" ]; then
-                                    total_cols=$(head -n 1 "$tbl_file" | awk -F'|' '{print NF}')
-                                fi
-                                new_row=""
-                                i=1
-                                while [ "$i" -le "$total_cols" ]; do
-                                    cell=""
-                                    [ "$i" -eq "$col_idx" ] && cell="$val"
-                                    if [ -z "$new_row" ]; then
-                                        new_row="$cell"
-                                    else
-                                        new_row="$new_row | $cell"
-                                    fi
-                                    i=$(expr "$i" + 1)
-                                done
-                                echo "$new_row" >> "$tbl_file"
-                                printf '%b' "${GREEN}Data inserted into column '$col_name' of '$tblname'.${NC}\n"
-                            fi
-                        else
-                            data="$param1"
-                            if [ -z "$data" ]; then
-                                printf '%b' "${RED}Error: Data required.${NC}\n"
-                            else
-                                echo "$data" >> "$tbl_file"
-                                printf '%b' "${GREEN}Data inserted into '$tblname'.${NC}\n"
-                            fi
-                        fi
+                        python3 -c '
+import sys, os
+tbl_file = sys.argv[1]
+args = sys.argv[2:]
+if not os.path.exists(tbl_file):
+    sys.exit(1)
+with open(tbl_file, "r") as f:
+    lines = [line.strip() for line in f if line.strip()]
+if not lines:
+    sys.exit(1)
+header = [c.strip() for c in lines[0].split("|")]
+num_cols = len(header)
+row_data = [""] * num_cols
+if len(args) >= 2 and args[0] in header:
+    i = 0
+    while i < len(args) - 1:
+        col = args[i]
+        val = args[i+1]
+        if col in header:
+            row_data[header.index(col)] = val
+            i += 2
+        else:
+            break
+elif len(args) == 1 and "|" in args[0]:
+    parts = [p.strip() for p in args[0].split("|")]
+    while len(parts) < num_cols:
+        parts.append("")
+    row_data = parts[:num_cols]
+elif len(args) == 2 and args[0] in header:
+    row_data[header.index(args[0])] = args[1]
+else:
+    joined = " ".join(args)
+    if "|" in joined:
+        parts = [p.strip() for p in joined.split("|")]
+        while len(parts) < num_cols:
+            parts.append("")
+        row_data = parts[:num_cols]
+    elif len(args) == 1:
+        row_data[0] = args[0]
+new_row = " | ".join(row_data)
+with open(tbl_file, "a") as f:
+    f.write(new_row + "\n")
+' "$tbl_file" "$@"
+                        printf '%b' "${GREEN}Data inserted into table '$tblname'.${NC}\n"
                     done
                 fi
                 echo ""
@@ -1191,7 +1428,7 @@ print("└" + "─" * (max_len + 4) + "┘")
                     content="$3"
                     newcontent="$4"
                     if [ -z "$tbl_name" ] || [ -z "$col_name" ] || [ -z "$content" ] || [ -z "$newcontent" ]; then
-                        printf '%b' "${RED}Error: Usage: update <tbl> <col> <content> <newcontent>${NC}\n"
+                        printf '%b' "${RED}Error: Usage: update <tbl> <col> <val> <newval>${NC}\n"
                     elif [ ! -e "db_manage/database/${CURRENT_DB}/tables/$tbl_name.tbl" ]; then
                         printf '%b' "${RED}Error: Table '$tbl_name' does not exist.${NC}\n"
                     else
@@ -1293,15 +1530,14 @@ print("└" + "─" * (max_len + 4) + "┘")
                         
                         set -- $item
                         tblname="$1"
-                        shift
-                        param1="$1"
-                        shift
-                        rest_params="$*"
-                        
                         if [ -z "$tblname" ]; then
                             printf '%b' "${RED}Error: Table name required.${NC}\n"
                             continue
                         fi
+                        shift
+                        param1="$1"
+                        [ $# -gt 0 ] && shift
+                        rest_params="$*"
                         
                         tbl_file="db_manage/database/${CURRENT_DB}/tables/$tblname.tbl"
                         if [ ! -e "$tbl_file" ]; then
@@ -1495,6 +1731,9 @@ print("└" + "─" * (max_len + 4) + "┘")
                     read -r api_address
                     printf '%b' "Enter API Port: "
                     read -r api_port
+                    printf '%b' "Enter API Debug (true or false) [true]: "
+                    read -r api_debug
+                    [ -z "$api_debug" ] && api_debug="true"
 
                     printf '%b' "\n${YELLOW}Available Secret Keys:${NC}\n"
                     has_k=0
@@ -1524,6 +1763,7 @@ Name=$api_name
 Protocol=$api_protocol
 Address=$api_address
 Port=$api_port
+ApiDebug=$api_debug
 SecretKey=$resolved_secret
 EOF
                     generate_server_script "$api_dir/server.py"
@@ -1555,6 +1795,7 @@ EOF
                     curr_proto="http"
                     curr_addr=""
                     curr_port=""
+                    curr_debug="true"
                     curr_secret="default_secret"
                     if [ -f "$api_cfg" ]; then
                         while IFS='=' read -r key val || [ -n "$key" ]; do
@@ -1563,6 +1804,7 @@ EOF
                                 Protocol) curr_proto="$val" ;;
                                 Address) curr_addr="$val" ;;
                                 Port) curr_port="$val" ;;
+                                ApiDebug) curr_debug="$val" ;;
                                 SecretKey) curr_secret="$val" ;;
                             esac
                         done < "$api_cfg"
@@ -1584,6 +1826,10 @@ EOF
                     printf '%b' "Enter new Port [$curr_port]: "
                     read -r new_port
                     [ -n "$new_port" ] && curr_port="$new_port"
+
+                    printf '%b' "Enter new API Debug [$curr_debug]: "
+                    read -r new_debug
+                    [ -n "$new_debug" ] && curr_debug="$new_debug"
 
                     printf '%b' "\n${YELLOW}Available Secret Keys:${NC}\n"
                     has_k=0
@@ -1611,6 +1857,7 @@ Name=$curr_name
 Protocol=$curr_proto
 Address=$curr_addr
 Port=$curr_port
+ApiDebug=$curr_debug
 SecretKey=$curr_secret
 EOF
                     generate_server_script "$api_dir/server.py"
@@ -1651,10 +1898,12 @@ EOF
                         api_name_val=$(grep "^Name=" "$api_cfg" 2>/dev/null | cut -d'=' -f2)
                         api_proto_val=$(grep "^Protocol=" "$api_cfg" 2>/dev/null | cut -d'=' -f2)
                         api_port_val=$(grep "^Port=" "$api_cfg" 2>/dev/null | cut -d'=' -f2)
+                        api_debug_val=$(grep "^ApiDebug=" "$api_cfg" 2>/dev/null | cut -d'=' -f2)
                         api_secret_val=$(grep "^SecretKey=" "$api_cfg" 2>/dev/null | cut -d'=' -f2)
                         
                         proto="${api_proto_val:-http}"
                         port="${api_port_val:-8080}"
+                        debug="${api_debug_val:-true}"
 
                         cert_arg=""
                         key_arg=""
@@ -1667,7 +1916,7 @@ EOF
                             key_arg="$api_dir/server.key"
                         fi
 
-                        API_PORT="$port" API_SECRET="${api_secret_val:-default_secret}" DB_NAME="$CURRENT_DB" API_PROTOCOL="$proto" API_TYPE="$api_type" API_CERT="$cert_arg" API_KEY="$key_arg" python3 "$server_script" > "$api_dir/server.log" 2>&1 &
+                        API_PORT="$port" API_SECRET="${api_secret_val:-default_secret}" DB_NAME="$CURRENT_DB" API_PROTOCOL="$proto" API_TYPE="$api_type" API_DEBUG="$debug" API_CERT="$cert_arg" API_KEY="$key_arg" python3 "$server_script" > "$api_dir/server.log" 2>&1 &
                         server_pid=$!
                         echo "$server_pid" > "$pid_file"
 
@@ -1685,7 +1934,7 @@ EOF
                     set -- $args
                     IFS="$OLD_IFS"
                     api_type="$1"
-                    shift
+                    [ -n "$api_type" ] && shift
                     [ -z "$api_type" ] && api_type="public"
                     
                     api_dir="db_manage/database/${CURRENT_DB}/api/$api_type"
@@ -1753,6 +2002,7 @@ EOF
                         api_proto_val=$(grep "^Protocol=" "$api_cfg" 2>/dev/null | cut -d'=' -f2)
                         api_addr_val=$(grep "^Address=" "$api_cfg" 2>/dev/null | cut -d'=' -f2)
                         api_port_val=$(grep "^Port=" "$api_cfg" 2>/dev/null | cut -d'=' -f2)
+                        api_debug_val=$(grep "^ApiDebug=" "$api_cfg" 2>/dev/null | cut -d'=' -f2)
                         api_type_upper=$(echo "$api_type" | tr '[:lower:]' '[:upper:]')
                         
                         printf '%b' "${CYAN}==================================================${NC}\n"
@@ -1763,6 +2013,7 @@ EOF
                         printf '%b' " Protocol: ${YELLOW}${api_proto_val:-http}${NC}\n"
                         printf '%b' " Address:  ${CYAN}${api_addr_val:-localhost}${NC}\n"
                         printf '%b' " Port:     ${CYAN}${api_port_val:-8080}${NC}\n"
+                        printf '%b' " Debug:    ${CYAN}${api_debug_val:-true}${NC}\n"
                         
                         is_running=0
                         if [ -f "$pid_file" ]; then
@@ -1792,7 +2043,7 @@ EOF
                     IFS="$OLD_IFS"
                     api_type="$1"
                     if [ "$api_type" = "public" ] || [ "$api_type" = "secret" ]; then
-                        shift
+                        [ $# -gt 0 ] && shift
                     else
                         api_type="public"
                     fi
@@ -1816,6 +2067,11 @@ EOF
                         port="${api_port_val:-8080}"
                         
                         sub_cmd="$1"
+                        if [ -z "$sub_cmd" ]; then
+                            printf '%b' "${RED}Error: Command required.${NC}\n"
+                            echo ""
+                            continue
+                        fi
                         shift
                         sub_args="$*"
                         
