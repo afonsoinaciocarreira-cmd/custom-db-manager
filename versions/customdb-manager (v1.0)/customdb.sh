@@ -141,7 +141,7 @@ class DBAPIHandler(http.server.BaseHTTPRequestHandler):
                 raise ValueError(f"Error: API restriction - Endpoint '{path}' is strictly prohibited.")
 
             if path in ["/", "/status"]:
-                tables = [f[:-4] for f in os.listdir(TABLES_DIR) if f.endswith(".tbl")] if os.path.exists(TABLES_DIR) else []
+                tables = [d for d in os.listdir(TABLES_DIR) if os.path.isdir(os.path.join(TABLES_DIR, d))] if os.path.exists(TABLES_DIR) else []
                 response_data.update({
                     "message": "Real database API server is running.",
                     "tables": tables
@@ -160,7 +160,7 @@ class DBAPIHandler(http.server.BaseHTTPRequestHandler):
                 if os.path.exists(db_file):
                     with open(db_file, "r") as f:
                         metadata = f.read()
-                tables = [f[:-4] for f in os.listdir(TABLES_DIR) if f.endswith(".tbl")] if os.path.exists(TABLES_DIR) else []
+                tables = [d for d in os.listdir(TABLES_DIR) if os.path.isdir(os.path.join(TABLES_DIR, d))] if os.path.exists(TABLES_DIR) else []
                 response_data.update({
                     "message": f"Universal database dump for '{DB_NAME}'.",
                     "metadata": json.loads(metadata) if metadata.startswith("{") else metadata,
@@ -171,7 +171,7 @@ class DBAPIHandler(http.server.BaseHTTPRequestHandler):
                 if not self._check_permission("show_tables"):
                     status_code = 403
                     raise ValueError("Error: Permission denied for 'show_tables'.")
-                tables = [f[:-4] for f in os.listdir(TABLES_DIR) if f.endswith(".tbl")] if os.path.exists(TABLES_DIR) else []
+                tables = [d for d in os.listdir(TABLES_DIR) if os.path.isdir(os.path.join(TABLES_DIR, d))] if os.path.exists(TABLES_DIR) else []
                 response_data["tables"] = tables
 
             elif path.startswith("/select_from/") or path.startswith("/select/"):
@@ -179,11 +179,12 @@ class DBAPIHandler(http.server.BaseHTTPRequestHandler):
                     status_code = 403
                     raise ValueError("Error: Permission denied for 'select_from'.")
                 tbl_name = path.split("/")[-1]
-                tbl_file = os.path.join(TABLES_DIR, f"{tbl_name}.tbl")
-                if not os.path.exists(tbl_file):
+                tbl_dir = os.path.join(TABLES_DIR, tbl_name)
+                data_file = os.path.join(tbl_dir, "tables")
+                if not os.path.exists(tbl_dir) or not os.path.exists(data_file):
                     status_code = 404
                     raise ValueError(f"Error: Table '{tbl_name}' does not exist.")
-                with open(tbl_file, "r") as f:
+                with open(data_file, "r") as f:
                     records = [line.strip() for line in f if line.strip()]
                 response_data["table"] = tbl_name
                 response_data["records"] = records
@@ -193,8 +194,10 @@ class DBAPIHandler(http.server.BaseHTTPRequestHandler):
                     status_code = 403
                     raise ValueError("Error: Permission denied for 'insert_into'.")
                 tbl_name = path.split("/")[-1]
-                tbl_file = os.path.join(TABLES_DIR, f"{tbl_name}.tbl")
-                if not os.path.exists(tbl_file):
+                tbl_dir = os.path.join(TABLES_DIR, tbl_name)
+                cols_file = os.path.join(tbl_dir, "columns")
+                data_file = os.path.join(tbl_dir, "tables")
+                if not os.path.exists(tbl_dir) or not os.path.exists(cols_file):
                     status_code = 404
                     raise ValueError(f"Error: Table '{tbl_name}' does not exist.")
                 
@@ -203,10 +206,29 @@ class DBAPIHandler(http.server.BaseHTTPRequestHandler):
                     status_code = 400
                     raise ValueError("Error: Missing data to insert.")
                 
-                with open(tbl_file, "a") as f:
-                    f.write(str(data_to_insert).strip() + "\n")
+                with open(cols_file, "r") as f:
+                    header = [c.strip() for c in f if c.strip()]
+                with open(data_file, "r") as f:
+                    lines = [line.strip() for line in f if line.strip()]
+                
+                num_cols = len(header)
+                next_id = str(len(lines) + 1)
+                row_data = [""] * num_cols
+                if header and header[0] == "id":
+                    row_data[0] = next_id
+                
+                parts = [p.strip() for p in str(data_to_insert).split("|")]
+                if header and header[0] == "id":
+                    parts = [next_id] + [p for i, p in enumerate(parts) if i > 0]
+                while len(parts) < num_cols:
+                    parts.append("")
+                row_data = parts[:num_cols]
+                
+                new_row = " | ".join(row_data)
+                with open(data_file, "a") as f:
+                    f.write(new_row + "\n")
                 response_data["message"] = f"Data successfully inserted into table '{tbl_name}'."
-                response_data["inserted_data"] = str(data_to_insert).strip()
+                response_data["inserted_data"] = new_row
 
             elif path.startswith("/create_table/"):
                 if not self._check_permission("create_table"):
@@ -216,12 +238,14 @@ class DBAPIHandler(http.server.BaseHTTPRequestHandler):
                 if not tbl_name or tbl_name == "create_table":
                     status_code = 400
                     raise ValueError("Error: Table name is required.")
-                tbl_file = os.path.join(TABLES_DIR, f"{tbl_name}.tbl")
-                if os.path.exists(tbl_file):
+                tbl_dir = os.path.join(TABLES_DIR, tbl_name)
+                if os.path.exists(tbl_dir):
                     status_code = 409
                     raise ValueError(f"Error: Table '{tbl_name}' already exists.")
-                with open(tbl_file, "w") as f:
-                    pass
+                os.makedirs(tbl_dir, exist_ok=True)
+                with open(os.path.join(tbl_dir, "columns"), "w") as f:
+                    f.write("id\n")
+                open(os.path.join(tbl_dir, "tables"), "w").close()
                 response_data["message"] = f"Table '{tbl_name}' created successfully."
 
             elif path.startswith("/drop_table/"):
@@ -229,11 +253,12 @@ class DBAPIHandler(http.server.BaseHTTPRequestHandler):
                     status_code = 403
                     raise ValueError("Error: Permission denied for 'drop_table'.")
                 tbl_name = path.split("/")[-1]
-                tbl_file = os.path.join(TABLES_DIR, f"{tbl_name}.tbl")
-                if not os.path.exists(tbl_file):
+                tbl_dir = os.path.join(TABLES_DIR, tbl_name)
+                if not os.path.exists(tbl_dir):
                     status_code = 404
                     raise ValueError(f"Error: Table '{tbl_name}' does not exist.")
-                os.remove(tbl_file)
+                import shutil
+                shutil.rmtree(tbl_dir)
                 response_data["message"] = f"Table '{tbl_name}' dropped successfully."
 
             elif path.startswith("/delete_from/"):
@@ -241,18 +266,12 @@ class DBAPIHandler(http.server.BaseHTTPRequestHandler):
                     status_code = 403
                     raise ValueError("Error: Permission denied for 'delete_from'.")
                 tbl_name = path.split("/")[-1]
-                tbl_file = os.path.join(TABLES_DIR, f"{tbl_name}.tbl")
-                if not os.path.exists(tbl_file):
+                tbl_dir = os.path.join(TABLES_DIR, tbl_name)
+                data_file = os.path.join(tbl_dir, "tables")
+                if not os.path.exists(tbl_dir):
                     status_code = 404
                     raise ValueError(f"Error: Table '{tbl_name}' does not exist.")
-                header = ""
-                with open(tbl_file, "r") as f_in:
-                    lines = f_in.readlines()
-                    if lines:
-                        header = lines[0]
-                with open(tbl_file, "w") as f_out:
-                    if header:
-                        f_out.write(header)
+                open(data_file, "w").close()
                 response_data["message"] = f"All records deleted from table '{tbl_name}'."
 
             elif path.startswith("/delete_record/"):
@@ -265,25 +284,21 @@ class DBAPIHandler(http.server.BaseHTTPRequestHandler):
                     raise ValueError("Error: Usage format /delete_record/<table_name>/<value>")
                 tbl_name = parts[1]
                 target_val = urllib.parse.unquote("/".join(parts[2:]))
-                tbl_file = os.path.join(TABLES_DIR, f"{tbl_name}.tbl")
-                if not os.path.exists(tbl_file):
+                tbl_dir = os.path.join(TABLES_DIR, tbl_name)
+                data_file = os.path.join(tbl_dir, "tables")
+                if not os.path.exists(tbl_dir):
                     status_code = 404
                     raise ValueError(f"Error: Table '{tbl_name}' does not exist.")
                 
-                tmp_file = tbl_file + ".tmp"
+                tmp_file = data_file + ".tmp"
                 found = False
-                with open(tbl_file, "r") as f_in, open(tmp_file, "w") as f_out:
-                    first = True
+                with open(data_file, "r") as f_in, open(tmp_file, "w") as f_out:
                     for line in f_in:
-                        if first:
-                            f_out.write(line)
-                            first = False
-                            continue
                         if line.strip() == target_val:
                             found = True
                         else:
                             f_out.write(line)
-                os.replace(tmp_file, tbl_file)
+                os.replace(tmp_file, data_file)
                 
                 if found:
                     response_data["message"] = f"Record deleted from table '{tbl_name}'."
@@ -444,6 +459,7 @@ drop_table=false
 delete_from=false
 delete_record=false
 create_column=false
+drop_column=false
 show_columns=false
 rename_column=false
 update=false
@@ -509,32 +525,46 @@ parse_interval() {
 }
 
 print_professional_table() {
-    tbl_file="$1"
+    tbl_dir="$1"
     python3 -c '
 import sys, os
-tbl_file = sys.argv[1]
-if not os.path.exists(tbl_file):
-    print("Error: Table file not found.")
+tbl_dir = sys.argv[1]
+cols_file = os.path.join(tbl_dir, "columns")
+data_file = os.path.join(tbl_dir, "tables")
+if not os.path.exists(cols_file):
+    print("Error: Table columns not found.")
     sys.exit(1)
-with open(tbl_file, "r") as f:
-    lines = [line.strip() for line in f if line.strip()]
-if not lines:
+with open(cols_file, "r") as f:
+    header = [c.strip().replace("\n", " ").replace("\r", "") for c in f if c.strip()]
+if not header:
+    header = ["id"]
+rows_data = []
+if os.path.exists(data_file):
+    with open(data_file, "r") as f:
+        rows_data = [line.strip() for line in f if line.strip()]
+
+num_cols = len(header)
+rows = [header]
+for line in rows_data:
+    r = [c.strip().replace("\n", " ").replace("\r", "") for c in line.split("|")]
+    while len(r) < num_cols:
+        r.append("")
+    rows.append(r[:num_cols])
+
+if len(rows) == 1:
     print("  (Table is empty)")
     sys.exit(0)
-rows = [[c.strip() for c in line.split("|")] for line in lines]
-max_cols = max(len(r) for r in rows)
-for r in rows:
-    while len(r) < max_cols:
-        r.append("")
-col_widths = [max(len(row[i]) for row in rows) for i in range(max_cols)]
+
+col_widths = [max(len(row[i]) for row in rows) for i in range(num_cols)]
 col_widths = [max(w, 4) for w in col_widths]
 def print_row(row, widths, is_header=False):
     formatted = []
     for i, val in enumerate(row):
-        padded = val.ljust(widths[i])
         if is_header:
+            padded = val.center(widths[i])
             cell_str = f"\033[1;32m{padded}\033[0m"
         else:
+            padded = val.ljust(widths[i])
             cell_str = padded
         formatted.append(cell_str)
     return "│ " + " │ ".join(formatted) + " │"
@@ -543,23 +573,30 @@ def print_separator(widths, left, mid, right, fill):
 print(print_separator(col_widths, "┌", "┬", "┐", "─"))
 print(print_row(rows[0], col_widths, is_header=True))
 print(print_separator(col_widths, "├", "┼", "┤", "─"))
-for row in rows[1:]:
+data_rows = rows[1:]
+for idx, row in enumerate(data_rows):
     print(print_row(row, col_widths, is_header=False))
-print(print_separator(col_widths, "└", "┴", "┘", "─"))
-' "$tbl_file"
+    if idx < len(data_rows) - 1:
+        print(print_separator(col_widths, "├", "┼", "┤", "─"))
+    else:
+        print(print_separator(col_widths, "└", "┴", "┘", "─"))
+' "$tbl_dir"
 }
 
 print_professional_columns() {
-    tbl_file="$1"
+    tbl_dir="$1"
     python3 -c '
 import sys, os
-tbl_file = sys.argv[1]
-with open(tbl_file, "r") as f:
-    header = f.readline().strip()
-if not header:
+tbl_dir = sys.argv[1]
+cols_file = os.path.join(tbl_dir, "columns")
+if not os.path.exists(cols_file):
     print("  (No columns found)")
     sys.exit(0)
-cols = [c.strip() for c in header.split("|")]
+with open(cols_file, "r") as f:
+    cols = [c.strip() for c in f if c.strip()]
+if not cols:
+    print("  (No columns found)")
+    sys.exit(0)
 max_len = max(len(c) for c in cols)
 max_len = max(max_len, 15)
 title_plain = "COLUMNS"
@@ -571,7 +608,7 @@ for c in cols:
     c_padded = f"{c:<{max_len}}"
     print(f"│ {c_padded} │")
 print("└" + "─" * (max_len + 4) + "┘")
-' "$tbl_file"
+' "$tbl_dir"
 }
 
 confirm_action() {
@@ -646,6 +683,7 @@ while true; do
                 printf '%b' "   ${CYAN}rename_table <name> <newname>${NC}     ${GRAY}- Rename a table${NC}\n"
                 printf '%b' "   ${CYAN}show_tables <tbl>${NC}                 ${GRAY}- List tables or show specific table${NC}\n"
                 printf '%b' "   ${CYAN}create_column <tbl> <col>${NC}         ${GRAY}- Add a column${NC}\n"
+                printf '%b' "   ${CYAN}drop_column <tbl> <col>${NC}           ${GRAY}- Delete a column${NC}\n"
                 printf '%b' "   ${CYAN}show_columns <tbl>${NC}                ${GRAY}- List columns in a table${NC}\n"
                 printf '%b' "   ${CYAN}rename_column <tbl> <col> <newcol>${NC} ${GRAY}- Rename a column${NC}\n\n"
                 printf '%b' " ${YELLOW}[ ⚡ DATA OPERATIONS ]${NC}\n"
@@ -1043,9 +1081,9 @@ else:
                     
                     tbl_dir="db_manage/database/${CURRENT_DB}/tables"
                     if [ -d "$tbl_dir" ]; then
-                        for tbl in "$tbl_dir"/*.tbl; do
-                            [ -e "$tbl" ] || continue
-                            tblname=$(basename "$tbl" .tbl)
+                        for tbl in "$tbl_dir"/*; do
+                            [ -d "$tbl" ] || continue
+                            tblname=$(basename "$tbl")
                             printf '%b' "\n${CYAN}${BOLD}Table: $tblname${NC}\n"
                             print_professional_table "$tbl"
                         done
@@ -1069,10 +1107,13 @@ else:
                     for tbl in "$@"; do
                         tbl=$(echo "$tbl" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
                         [ -z "$tbl" ] && continue
-                        if [ -e "db_manage/database/${CURRENT_DB}/tables/$tbl.tbl" ]; then
+                        tbl_dir="db_manage/database/${CURRENT_DB}/tables/$tbl"
+                        if [ -e "$tbl_dir" ]; then
                             printf '%b' "${RED}Error: Table '$tbl' already exists.${NC}\n"
                         else
-                            touch "db_manage/database/${CURRENT_DB}/tables/$tbl.tbl"
+                            mkdir -p "$tbl_dir"
+                            echo "id" > "$tbl_dir/columns"
+                            touch "$tbl_dir/tables"
                             printf '%b' "${GREEN}Table '$tbl' created successfully.${NC}\n"
                         fi
                     done
@@ -1092,8 +1133,9 @@ else:
                     for tbl in "$@"; do
                         tbl=$(echo "$tbl" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
                         [ -z "$tbl" ] && continue
-                        if [ -e "db_manage/database/${CURRENT_DB}/tables/$tbl.tbl" ]; then
-                            rm "db_manage/database/${CURRENT_DB}/tables/$tbl.tbl"
+                        tbl_dir="db_manage/database/${CURRENT_DB}/tables/$tbl"
+                        if [ -e "$tbl_dir" ]; then
+                            rm -rf "$tbl_dir"
                             printf '%b' "${GREEN}Table '$tbl' dropped successfully.${NC}\n"
                         else
                             printf '%b' "${RED}Error: Table '$tbl' does not exist.${NC}\n"
@@ -1114,12 +1156,12 @@ else:
                     new_tbl="$2"
                     if [ -z "$old_tbl" ] || [ -z "$new_tbl" ]; then
                         printf '%b' "${RED}Error: Usage: rename_table <name> <newname>${NC}\n"
-                    elif [ ! -e "db_manage/database/${CURRENT_DB}/tables/$old_tbl.tbl" ]; then
+                    elif [ ! -e "db_manage/database/${CURRENT_DB}/tables/$old_tbl" ]; then
                         printf '%b' "${RED}Error: Table '$old_tbl' does not exist.${NC}\n"
-                    elif [ -e "db_manage/database/${CURRENT_DB}/tables/$new_tbl.tbl" ]; then
+                    elif [ -e "db_manage/database/${CURRENT_DB}/tables/$new_tbl" ]; then
                         printf '%b' "${RED}Error: Table '$new_tbl' already exists.${NC}\n"
                     else
-                        mv "db_manage/database/${CURRENT_DB}/tables/$old_tbl.tbl" "db_manage/database/${CURRENT_DB}/tables/$new_tbl.tbl"
+                        mv "db_manage/database/${CURRENT_DB}/tables/$old_tbl" "db_manage/database/${CURRENT_DB}/tables/$new_tbl"
                         printf '%b' "${GREEN}Table '$old_tbl' renamed to '$new_tbl' successfully.${NC}\n"
                     fi
                 fi
@@ -1135,36 +1177,110 @@ else:
                     tbl_name="$1"
                     if [ -z "$tbl_name" ]; then
                         printf '%b' "${RED}Error: Usage: create_column <tbl> <col>${NC}\n"
-                    elif [ ! -e "db_manage/database/${CURRENT_DB}/tables/$tbl_name.tbl" ]; then
+                    elif [ ! -e "db_manage/database/${CURRENT_DB}/tables/$tbl_name" ]; then
                         printf '%b' "${RED}Error: Table '$tbl_name' does not exist.${NC}\n"
                     else
                         shift
                         if [ $# -eq 0 ]; then
                             printf '%b' "${RED}Error: Column name required.${NC}\n"
                         else
-                            tbl_file="db_manage/database/${CURRENT_DB}/tables/$tbl_name.tbl"
+                            tbl_dir="db_manage/database/${CURRENT_DB}/tables/$tbl_name"
                             for col_name in "$@"; do
                                 col_name=$(echo "$col_name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
                                 [ -z "$col_name" ] && continue
-                                if [ ! -s "$tbl_file" ]; then
-                                    echo "$col_name" > "$tbl_file"
-                                    printf '%b' "${GREEN}Column '$col_name' added to table '$tbl_name'.${NC}\n"
-                                else
-                                    tmp_file="$tbl_file.tmp"
-                                    rm -f "$tmp_file"
-                                    first_line=1
-                                    while IFS= read -r line || [ -n "$line" ]; do
-                                        if [ "$first_line" -eq 1 ]; then
-                                            echo "$line | $col_name" >> "$tmp_file"
-                                            first_line=0
-                                        else
-                                            echo "$line | " >> "$tmp_file"
-                                        fi
-                                    done < "$tbl_file"
-                                    mv "$tmp_file" "$tbl_file"
-                                    printf '%b' "${GREEN}Column '$col_name' added to table '$tbl_name'.${NC}\n"
-                                fi
+                                python3 -c '
+import sys, os
+tbl_dir = sys.argv[1]
+col_name = sys.argv[2]
+cols_file = os.path.join(tbl_dir, "columns")
+data_file = os.path.join(tbl_dir, "tables")
+if not os.path.exists(cols_file):
+    sys.exit(1)
+with open(cols_file, "r") as f:
+    cols = [c.strip() for c in f if c.strip()]
+if col_name in cols:
+    sys.exit(0)
+cols.append(col_name)
+with open(cols_file, "w") as f:
+    for c in cols:
+        f.write(c + "\n")
+if os.path.exists(data_file):
+    with open(data_file, "r") as f:
+        lines = [line.rstrip("\n\r") for line in f if line.strip()]
+    new_lines = []
+    for line in lines:
+        parts = [c.strip() for c in line.split("|")]
+        while len(parts) < len(cols) - 1:
+            parts.append("")
+        parts.append("")
+        new_lines.append(" | ".join(parts))
+    with open(data_file, "w") as f:
+        for l in new_lines:
+            f.write(l + "\n")
+' "$tbl_dir" "$col_name"
+                                printf '%b' "${GREEN}Column '$col_name' added to table '$tbl_name'.${NC}\n"
                             done
+                        fi
+                    fi
+                fi
+                echo ""
+                ;;
+            "drop_column")
+                if [ "$CURRENT_DB" = "none" ]; then
+                    printf '%b' "${RED}Error: No active database. Use 'use <name>' first.${NC}\n"
+                else
+                    set -- $args
+                    tbl_name="$1"
+                    col_name="$2"
+                    if [ -z "$tbl_name" ] || [ -z "$col_name" ]; then
+                        printf '%b' "${RED}Error: Usage: drop_column <tbl> <col>${NC}\n"
+                    elif [ ! -e "db_manage/database/${CURRENT_DB}/tables/$tbl_name" ]; then
+                        printf '%b' "${RED}Error: Table '$tbl_name' does not exist.${NC}\n"
+                    else
+                        tbl_dir="db_manage/database/${CURRENT_DB}/tables/$tbl_name"
+                        python3 -c '
+import sys, os
+tbl_dir = sys.argv[1]
+col_name = sys.argv[2]
+cols_file = os.path.join(tbl_dir, "columns")
+data_file = os.path.join(tbl_dir, "tables")
+if not os.path.exists(cols_file):
+    print("Error: Table not found.")
+    sys.exit(1)
+with open(cols_file, "r") as f:
+    cols = [c.strip() for c in f if c.strip()]
+if col_name not in cols:
+    print(f"Error: Column '\''{col_name}'\'' not found.")
+    sys.exit(1)
+if col_name == "id":
+    print("Error: Cannot drop primary id column.")
+    sys.exit(1)
+col_idx = cols.index(col_name)
+cols.pop(col_idx)
+with open(cols_file, "w") as f:
+    for c in cols:
+        f.write(c + "\n")
+if os.path.exists(data_file):
+    with open(data_file, "r") as f:
+        lines = [line.strip() for line in f if line.strip()]
+    new_lines = []
+    for line in lines:
+        parts = [c.strip() for c in line.split("|")]
+        while len(parts) <= col_idx:
+            parts.append("")
+        parts.pop(col_idx)
+        new_lines.append(" | ".join(parts))
+    with open(data_file, "w") as f:
+        for l in new_lines:
+            f.write(l + "\n")
+print("SUCCESS")
+' "$tbl_dir" "$col_name" > "$tbl_dir/result.tmp"
+                        if grep -q "SUCCESS" "$tbl_dir/result.tmp"; then
+                            rm -f "$tbl_dir/result.tmp"
+                            printf '%b' "${GREEN}Column '$col_name' dropped from table '$tbl_name'.${NC}\n"
+                        else
+                            cat "$tbl_dir/result.tmp" | sed 's/^/\033[0;31m/;s/$/\033[0m/'
+                            rm -f "$tbl_dir/result.tmp"
                         fi
                     fi
                 fi
@@ -1181,15 +1297,15 @@ else:
                     tbl_name="$1"
                     if [ -z "$tbl_name" ]; then
                         printf '%b' "${RED}Error: Usage: show_columns <tbl>${NC}\n"
-                    elif [ ! -e "db_manage/database/${CURRENT_DB}/tables/$tbl_name.tbl" ]; then
+                    elif [ ! -e "db_manage/database/${CURRENT_DB}/tables/$tbl_name" ]; then
                         printf '%b' "${RED}Error: Table '$tbl_name' does not exist.${NC}\n"
                     else
-                        tbl_file="db_manage/database/${CURRENT_DB}/tables/$tbl_name.tbl"
-                        if [ ! -s "$tbl_file" ]; then
+                        tbl_dir="db_manage/database/${CURRENT_DB}/tables/$tbl_name"
+                        if [ ! -s "$tbl_dir/columns" ]; then
                             printf '%b' "${RED}Error: Table '$tbl_name' has no columns.${NC}\n"
                         else
                             printf '%b' "${CYAN}${BOLD}Columns in table '$tbl_name':${NC}\n"
-                            print_professional_columns "$tbl_file"
+                            print_professional_columns "$tbl_dir"
                         fi
                     fi
                 fi
@@ -1205,35 +1321,26 @@ else:
                     new_col="$3"
                     if [ -z "$tbl_name" ] || [ -z "$old_col" ] || [ -z "$new_col" ]; then
                         printf '%b' "${RED}Error: Usage: rename_column <tbl> <col> <newcol>${NC}\n"
-                    elif [ ! -e "db_manage/database/${CURRENT_DB}/tables/$tbl_name.tbl" ]; then
+                    elif [ ! -e "db_manage/database/${CURRENT_DB}/tables/$tbl_name" ]; then
                         printf '%b' "${RED}Error: Table '$tbl_name' does not exist.${NC}\n"
                     else
-                        tbl_file="db_manage/database/${CURRENT_DB}/tables/$tbl_name.tbl"
-                        header=$(head -n 1 "$tbl_file")
+                        tbl_dir="db_manage/database/${CURRENT_DB}/tables/$tbl_name"
+                        cols_file="$tbl_dir/columns"
                         found=0
-                        new_header=""
-                        OLD_IFS2="$IFS"
-                        IFS='|'
-                        set -- $header
-                        IFS="$OLD_IFS2"
-                        for col in "$@"; do
+                        temp_cols="$cols_file.tmp"
+                        while IFS= read -r col || [ -n "$col" ]; do
                             col=$(echo "$col" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                            [ -z "$col" ] && continue
                             if [ "$col" = "$old_col" ]; then
-                                col="$new_col"
+                                echo "$new_col" >> "$temp_cols"
                                 found=1
-                            fi
-                            if [ -z "$new_header" ]; then
-                                new_header="$col"
                             else
-                                new_header="$new_header | $col"
+                                echo "$col" >> "$temp_cols"
                             fi
-                        done
+                        done < "$cols_file"
+                        mv "$temp_cols" "$cols_file"
                         
                         if [ "$found" -eq 1 ]; then
-                            tmp_file="$tbl_file.tmp"
-                            echo "$new_header" > "$tmp_file"
-                            tail -n +2 "$tbl_file" >> "$tmp_file"
-                            mv "$tmp_file" "$tbl_file"
                             printf '%b' "${GREEN}Column '$old_col' renamed to '$new_col'.${NC}\n"
                         else
                             printf '%b' "${RED}Error: Column '$old_col' not found.${NC}\n"
@@ -1276,18 +1383,18 @@ else:
                     
                     if [ -n "$target_tbl" ]; then
                         target_tbl=$(echo "$target_tbl" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                        tbl_file="db_manage/database/${CURRENT_DB}/tables/$target_tbl.tbl"
-                        if [ -e "$tbl_file" ]; then
+                        tbl_dir="db_manage/database/${CURRENT_DB}/tables/$target_tbl"
+                        if [ -e "$tbl_dir" ]; then
                             printf '%b' "${CYAN}${BOLD}Complete Table View: '$target_tbl'${NC}\n"
-                            print_professional_table "$tbl_file"
+                            print_professional_table "$tbl_dir"
                         else
                             printf '%b' "${RED}Error: Table '$target_tbl' does not exist in database '$CURRENT_DB'.${NC}\n"
                         fi
                     else
                         tbl_count=0
                         if [ -d "db_manage/database/${CURRENT_DB}/tables" ]; then
-                            for tbl in db_manage/database/${CURRENT_DB}/tables/*.tbl; do
-                                [ -e "$tbl" ] && tbl_count=$(expr "$tbl_count" + 1)
+                            for tbl_d in db_manage/database/${CURRENT_DB}/tables/*; do
+                                [ -d "$tbl_d" ] && tbl_count=$(expr "$tbl_count" + 1)
                             done
                         fi
 
@@ -1298,7 +1405,7 @@ else:
                             python3 -c '
 import glob, os, sys
 db = sys.argv[1]
-tbls = [os.path.basename(f)[:-4] for f in glob.glob(f"db_manage/database/{db}/tables/*.tbl")]
+tbls = [os.path.basename(f) for f in glob.glob(f"db_manage/database/{db}/tables/*") if os.path.isdir(f)]
 max_len = max(len(t) for t in tbls) if tbls else 10
 max_len = max(max_len, 15)
 title_plain = "TABLES"
@@ -1337,55 +1444,72 @@ print("└" + "─" * (max_len + 4) + "┘")
                         fi
                         shift
                         
-                        tbl_file="db_manage/database/${CURRENT_DB}/tables/$tblname.tbl"
-                        if [ ! -e "$tbl_file" ]; then
+                        tbl_dir="db_manage/database/${CURRENT_DB}/tables/$tblname"
+                        if [ ! -e "$tbl_dir" ]; then
                             printf '%b' "${RED}Error: Table '$tblname' does not exist.${NC}\n"
                             continue
                         fi
                         
                         python3 -c '
 import sys, os
-tbl_file = sys.argv[1]
+tbl_dir = sys.argv[1]
 args = sys.argv[2:]
-if not os.path.exists(tbl_file):
+cols_file = os.path.join(tbl_dir, "columns")
+data_file = os.path.join(tbl_dir, "tables")
+if not os.path.exists(cols_file):
     sys.exit(1)
-with open(tbl_file, "r") as f:
-    lines = [line.strip() for line in f if line.strip()]
-if not lines:
-    sys.exit(1)
-header = [c.strip() for c in lines[0].split("|")]
+with open(cols_file, "r") as f:
+    header = [c.strip() for c in f if c.strip()]
+if not header:
+    header = ["id"]
+
+rows_count = 0
+if os.path.exists(data_file):
+    with open(data_file, "r") as f:
+        rows_count = sum(1 for line in f if line.strip())
+
 num_cols = len(header)
+next_id = str(rows_count + 1)
 row_data = [""] * num_cols
+if header and header[0] == "id":
+    row_data[0] = next_id
+
 if len(args) >= 2 and args[0] in header:
     i = 0
     while i < len(args) - 1:
         col = args[i]
         val = args[i+1]
-        if col in header:
+        if col in header and col != "id":
             row_data[header.index(col)] = val
             i += 2
         else:
-            break
+            i += 1
 elif len(args) == 1 and "|" in args[0]:
-    parts = [p.strip() for p in args[0].split("|")]
+    parts = [p.strip().replace("\n", " ").replace("\r", "") for p in args[0].split("|")]
+    if header and header[0] == "id":
+        parts = [next_id] + [p for i, p in enumerate(parts) if i > 0]
     while len(parts) < num_cols:
         parts.append("")
     row_data = parts[:num_cols]
-elif len(args) == 2 and args[0] in header:
-    row_data[header.index(args[0])] = args[1]
 else:
     joined = " ".join(args)
     if "|" in joined:
-        parts = [p.strip() for p in joined.split("|")]
+        parts = [p.strip().replace("\n", " ").replace("\r", "") for p in joined.split("|")]
+        if header and header[0] == "id":
+            parts = [next_id] + [p for i, p in enumerate(parts) if i > 0]
         while len(parts) < num_cols:
             parts.append("")
         row_data = parts[:num_cols]
-    elif len(args) == 1:
-        row_data[0] = args[0]
+    elif len(args) == 1 and num_cols > 1:
+        row_data[1] = args[0]
+    elif len(args) >= 1 and num_cols > 1:
+        row_data[1] = args[0]
+
+row_data = [str(v).replace("\n", " ").replace("\r", "") for v in row_data]
 new_row = " | ".join(row_data)
-with open(tbl_file, "a") as f:
+with open(data_file, "a") as f:
     f.write(new_row + "\n")
-' "$tbl_file" "$@"
+' "$tbl_dir" "$@"
                         printf '%b' "${GREEN}Data inserted into table '$tblname'.${NC}\n"
                     done
                 fi
@@ -1404,10 +1528,10 @@ with open(tbl_file, "a") as f:
                     for tbl in "$@"; do
                         tbl=$(echo "$tbl" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
                         [ -z "$tbl" ] && continue
-                        tbl_file="db_manage/database/${CURRENT_DB}/tables/$tbl.tbl"
-                        if [ -e "$tbl_file" ]; then
+                        tbl_dir="db_manage/database/${CURRENT_DB}/tables/$tbl"
+                        if [ -e "$tbl_dir" ]; then
                             printf '%b' "${CYAN}${BOLD}Records from table '$tbl':${NC}\n"
-                            print_professional_table "$tbl_file"
+                            print_professional_table "$tbl_dir"
                         else
                             printf '%b' "${RED}Error: Table '$tbl' does not exist.${NC}\n"
                         fi
@@ -1429,61 +1553,54 @@ with open(tbl_file, "a") as f:
                     newcontent="$4"
                     if [ -z "$tbl_name" ] || [ -z "$col_name" ] || [ -z "$content" ] || [ -z "$newcontent" ]; then
                         printf '%b' "${RED}Error: Usage: update <tbl> <col> <val> <newval>${NC}\n"
-                    elif [ ! -e "db_manage/database/${CURRENT_DB}/tables/$tbl_name.tbl" ]; then
+                    elif [ ! -e "db_manage/database/${CURRENT_DB}/tables/$tbl_name" ]; then
                         printf '%b' "${RED}Error: Table '$tbl_name' does not exist.${NC}\n"
                     else
-                        tbl_file="db_manage/database/${CURRENT_DB}/tables/$tbl_name.tbl"
-                        header=$(head -n 1 "$tbl_file")
+                        tbl_dir="db_manage/database/${CURRENT_DB}/tables/$tbl_name"
+                        cols_file="$tbl_dir/columns"
+                        data_file="$tbl_dir/tables"
+                        
                         col_idx=-1
                         curr_idx=1
-                        OLD_IFS2="$IFS"
-                        IFS='|'
-                        set -- $header
-                        IFS="$OLD_IFS2"
-                        for col in "$@"; do
+                        while IFS= read -r col || [ -n "$col" ]; do
                             col=$(echo "$col" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                            [ -z "$col" ] && continue
                             if [ "$col" = "$col_name" ]; then
                                 col_idx="$curr_idx"
                                 break
                             fi
                             curr_idx=$(expr "$curr_idx" + 1)
-                        done
+                        done < "$cols_file"
                         
                         if [ "$col_idx" -eq -1 ]; then
                             printf '%b' "${RED}Error: Column '$col_name' does not exist.${NC}\n"
                         else
-                            tmp_file="$tbl_file.tmp"
+                            tmp_file="$data_file.tmp"
                             updated_count=0
-                            first_line=1
                             while IFS= read -r line || [ -n "$line" ]; do
-                                if [ "$first_line" -eq 1 ]; then
-                                    echo "$line" > "$tmp_file"
-                                    first_line=0
-                                else
-                                    row_line="$line"
-                                    row_idx=1
-                                    new_row=""
-                                    OLD_IFS2="$IFS"
-                                    IFS='|'
-                                    set -- $row_line
-                                    IFS="$OLD_IFS2"
-                                    for val in "$@"; do
-                                        val_trimmed=$(echo "$val" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                                        if [ "$row_idx" -eq "$col_idx" ] && [ "$val_trimmed" = "$content" ]; then
-                                            val=" $newcontent "
-                                            updated_count=$(expr "$updated_count" + 1)
-                                        fi
-                                        if [ -z "$new_row" ]; then
-                                            new_row="$val"
-                                        else
-                                            new_row="$new_row | $val"
-                                        fi
-                                        row_idx=$(expr "$row_idx" + 1)
-                                    done
-                                    echo "$new_row" >> "$tmp_file"
-                                fi
-                            done < "$tbl_file"
-                            mv "$tmp_file" "$tbl_file"
+                                row_line="$line"
+                                row_idx=1
+                                new_row=""
+                                OLD_IFS2="$IFS"
+                                IFS='|'
+                                set -- $row_line
+                                IFS="$OLD_IFS2"
+                                for val in "$@"; do
+                                    val_trimmed=$(echo "$val" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                                    if [ "$row_idx" -eq "$col_idx" ] && [ "$val_trimmed" = "$content" ]; then
+                                        val=" $(echo "$newcontent" | tr '\n' ' ' | tr '\r' ' ') "
+                                        updated_count=$(expr "$updated_count" + 1)
+                                    fi
+                                    if [ -z "$new_row" ]; then
+                                        new_row="$val"
+                                    else
+                                        new_row="$new_row | $val"
+                                    fi
+                                    row_idx=$(expr "$row_idx" + 1)
+                                done
+                                echo "$new_row" >> "$tmp_file"
+                            done < "$data_file"
+                            mv "$tmp_file" "$data_file"
                             printf '%b' "${GREEN}Updated $updated_count record(s).${NC}\n"
                         fi
                     fi
@@ -1503,10 +1620,10 @@ with open(tbl_file, "a") as f:
                     for tbl in "$@"; do
                         tbl=$(echo "$tbl" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
                         [ -z "$tbl" ] && continue
-                        tbl_file="db_manage/database/${CURRENT_DB}/tables/$tbl.tbl"
-                        if [ -e "$tbl_file" ]; then
-                            header=$(head -n 1 "$tbl_file")
-                            echo "$header" > "$tbl_file"
+                        tbl_dir="db_manage/database/${CURRENT_DB}/tables/$tbl"
+                        data_file="$tbl_dir/tables"
+                        if [ -e "$tbl_dir" ]; then
+                            open(data_file, "w").close() 2>/dev/null || > "$data_file"
                             printf '%b' "${GREEN}All records deleted from table '$tbl'.${NC}\n"
                         else
                             printf '%b' "${RED}Error: Table '$tbl' does not exist.${NC}\n"
@@ -1539,8 +1656,10 @@ with open(tbl_file, "a") as f:
                         [ $# -gt 0 ] && shift
                         rest_params="$*"
                         
-                        tbl_file="db_manage/database/${CURRENT_DB}/tables/$tblname.tbl"
-                        if [ ! -e "$tbl_file" ]; then
+                        tbl_dir="db_manage/database/${CURRENT_DB}/tables/$tblname"
+                        cols_file="$tbl_dir/columns"
+                        data_file="$tbl_dir/tables"
+                        if [ ! -e "$tbl_dir" ]; then
                             printf '%b' "${RED}Error: Table '$tblname' does not exist.${NC}\n"
                             continue
                         fi
@@ -1548,34 +1667,24 @@ with open(tbl_file, "a") as f:
                         if [ -n "$rest_params" ]; then
                             col_name="$param1"
                             target_val="$rest_params"
-                            header=$(head -n 1 "$tbl_file")
                             col_idx=-1
                             curr_idx=1
-                            OLD_IFS2="$IFS"
-                            IFS='|'
-                            set -- $header
-                            IFS="$OLD_IFS2"
-                            for col in "$@"; do
+                            while IFS= read -r col || [ -n "$col" ]; do
                                 col=$(echo "$col" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                                [ -z "$col" ] && continue
                                 if [ "$col" = "$col_name" ]; then
                                     col_idx="$curr_idx"
                                     break
                                 fi
                                 curr_idx=$(expr "$curr_idx" + 1)
-                            done
+                            done < "$cols_file"
                             
                             if [ "$col_idx" -eq -1 ]; then
                                 printf '%b' "${RED}Error: Column '$col_name' does not exist.${NC}\n"
                             else
-                                tmp_file="$tbl_file.tmp"
+                                tmp_file="$data_file.tmp"
                                 found=0
-                                first=1
                                 while IFS= read -r row || [ -n "$row" ]; do
-                                    if [ "$first" -eq 1 ]; then
-                                        echo "$row" > "$tmp_file"
-                                        first=0
-                                        continue
-                                    fi
                                     row_idx=1
                                     match=0
                                     OLD_IFS2="$IFS"
@@ -1596,9 +1705,9 @@ with open(tbl_file, "a") as f:
                                     else
                                         echo "$row" >> "$tmp_file"
                                     fi
-                                done < "$tbl_file"
+                                done < "$data_file"
                                 
-                                [ -f "$tmp_file" ] && mv "$tmp_file" "$tbl_file"
+                                [ -f "$tmp_file" ] && mv "$tmp_file" "$data_file"
                                 
                                 if [ "$found" -eq 1 ]; then
                                     printf '%b' "${GREEN}Record where '$col_name' = '$target_val' deleted successfully.${NC}\n"
@@ -1611,23 +1720,17 @@ with open(tbl_file, "a") as f:
                             if [ -z "$target" ]; then
                                 printf '%b' "${RED}Error: Value required.${NC}\n"
                             else
-                                tmp_file="$tbl_file.tmp"
+                                tmp_file="$data_file.tmp"
                                 found=0
-                                first=1
                                 while IFS= read -r row || [ -n "$row" ]; do
-                                    if [ "$first" -eq 1 ]; then
-                                        echo "$row" > "$tmp_file"
-                                        first=0
-                                        continue
-                                    fi
                                     if [ "$row" = "$target" ]; then
                                         found=1
                                     else
                                         echo "$row" >> "$tmp_file"
                                     fi
-                                done < "$tbl_file"
+                                done < "$data_file"
                                 
-                                [ -f "$tmp_file" ] && mv "$tmp_file" "$tbl_file"
+                                [ -f "$tmp_file" ] && mv "$tmp_file" "$data_file"
 
                                 if [ "$found" -eq 1 ]; then
                                     printf '%b' "${GREEN}Record '$target' deleted successfully.${NC}\n"
