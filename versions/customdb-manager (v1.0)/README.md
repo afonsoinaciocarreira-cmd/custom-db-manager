@@ -1,1 +1,1 @@
-THIS version is under development (README.md in 10/07/2026)
+THIS version is under development (README.md in 08/10/2026)
