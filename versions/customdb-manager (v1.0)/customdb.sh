@@ -835,7 +835,7 @@ else:
                         k=$(echo "$k" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/\r//g')
                         v=$(echo "$v" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/\r//g')
                         case "$k" in
-                            \[*\])
+                            [[]*[]])
                                 curr_cat="$k"
                                 printf '%b' "\n  ${YELLOW}${curr_cat}${NC}\n"
                                 ;;
@@ -856,7 +856,7 @@ else:
                     found_c=0
                     while IFS='=' read -r k v || [ -n "$k" ]; do
                         case "$k" in
-                            \[*\])
+                            [[]*[]])
                                 echo "$k" >> "$temp_f"
                                 ;;
                             *)
@@ -1623,7 +1623,7 @@ with open(data_file, "a") as f:
                         tbl_dir="db_manage/database/${CURRENT_DB}/tables/$tbl"
                         data_file="$tbl_dir/tables"
                         if [ -e "$tbl_dir" ]; then
-                            open(data_file, "w").close() 2>/dev/null || > "$data_file"
+                            > "$data_file"
                             printf '%b' "${GREEN}All records deleted from table '$tbl'.${NC}\n"
                         else
                             printf '%b' "${RED}Error: Table '$tbl' does not exist.${NC}\n"
