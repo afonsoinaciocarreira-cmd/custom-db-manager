@@ -1,5 +1,3 @@
-#!/bin/sh
-
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -12,7 +10,7 @@ NC='\033[0m'
 CURRENT_DB="none"
 HOST=$(hostname 2>/dev/null || echo "localhost")
 
-mkdir -p db_manage/database db_manage/secrets backups
+mkdir -p db_manage/database db_manage/secrets db_manage/backups
 [ -e "db_manage/secrets/secrets.env" ] || touch "db_manage/secrets/secrets.env"
 [ -e "db_manage/secrets/database.cfg" ] || touch "db_manage/secrets/database.cfg"
 [ -e "db_manage/secrets/api.cfg" ] || touch "db_manage/secrets/api.cfg"
@@ -185,7 +183,7 @@ class DBAPIHandler(http.server.BaseHTTPRequestHandler):
                     status_code = 404
                     raise ValueError(f"Error: Table '{tbl_name}' does not exist.")
                 with open(data_file, "r") as f:
-                    records = [line.strip() for line in f if line.strip()]
+                    records = [line.replace("\r", "").strip() for line in f if line.strip()]
                 response_data["table"] = tbl_name
                 response_data["records"] = records
 
@@ -207,28 +205,80 @@ class DBAPIHandler(http.server.BaseHTTPRequestHandler):
                     raise ValueError("Error: Missing data to insert.")
                 
                 with open(cols_file, "r") as f:
-                    header = [c.strip() for c in f if c.strip()]
-                with open(data_file, "r") as f:
-                    lines = [line.strip() for line in f if line.strip()]
-                
+                    header = [c.replace("\r", "").strip() for c in f if c.strip()]
+                if not header:
+                    header = ["id"]
                 num_cols = len(header)
-                next_id = str(len(lines) + 1)
-                row_data = [""] * num_cols
-                if header and header[0] == "id":
-                    row_data[0] = next_id
                 
-                parts = [p.strip() for p in str(data_to_insert).split("|")]
-                if header and header[0] == "id":
-                    parts = [next_id] + [p for i, p in enumerate(parts) if i > 0]
-                while len(parts) < num_cols:
-                    parts.append("")
-                row_data = parts[:num_cols]
+                lines = []
+                if os.path.exists(data_file):
+                    with open(data_file, "r") as f:
+                        lines = [line.replace("\r", "").strip() for line in f if line.strip()]
                 
-                new_row = " | ".join(row_data)
-                with open(data_file, "a") as f:
-                    f.write(new_row + "\n")
+                rows = []
+                for line in lines:
+                    parts = [p.strip().replace("\n", " ").replace("\r", "") for p in line.split(" ")]
+                    while len(parts) < num_cols:
+                        parts.append("")
+                    rows.append(parts[:num_cols])
+                
+                target_map = {}
+                if isinstance(data_to_insert, dict):
+                    for k, v in data_to_insert.items():
+                        if k in header and k != "id":
+                            target_map[header.index(k)] = str(v).replace("\n", " ").replace("\r", "")
+                else:
+                    raw_str = str(data_to_insert).replace("\n", " ").replace("\r", "")
+                    parts = [p.strip() for p in raw_str.replace("|", " ").split(" ") if p.strip()]
+                    if parts and parts[0] in header:
+                        i = 0
+                        while i < len(parts) - 1:
+                            col = parts[i]
+                            val = parts[i+1]
+                            if col in header and col != "id":
+                                target_map[header.index(col)] = val
+                                i += 2
+                            else:
+                                i += 1
+                    else:
+                        start_idx = 1 if (header and header[0] == "id") else 0
+                        for idx, p in enumerate(parts):
+                            c_idx = start_idx + idx
+                            if c_idx < num_cols:
+                                target_map[c_idx] = p
+
+                target_row_idx = -1
+                if target_map:
+                    for r_idx, r in enumerate(rows):
+                        is_empty = True
+                        for c_idx in target_map:
+                            if r[c_idx] != "":
+                                is_empty = False
+                                break
+                        if is_empty:
+                            target_row_idx = r_idx
+                            break
+
+                if target_row_idx != -1:
+                    for c_idx, val in target_map.items():
+                        rows[target_row_idx][c_idx] = val
+                    inserted_row = rows[target_row_idx]
+                else:
+                    new_row = [""] * num_cols
+                    if header and header[0] == "id":
+                        new_row[0] = str(len(rows) + 1)
+                    for c_idx, val in target_map.items():
+                        new_row[c_idx] = val
+                    rows.append(new_row)
+                    inserted_row = new_row
+
+                with open(data_file, "w") as f:
+                    for r in rows:
+                        f.write(" ".join(r) + "\n")
+
+                new_row_str = " ".join(inserted_row)
                 response_data["message"] = f"Data successfully inserted into table '{tbl_name}'."
-                response_data["inserted_data"] = new_row
+                response_data["inserted_data"] = new_row_str
 
             elif path.startswith("/create_table/"):
                 if not self._check_permission("create_table"):
@@ -294,10 +344,11 @@ class DBAPIHandler(http.server.BaseHTTPRequestHandler):
                 found = False
                 with open(data_file, "r") as f_in, open(tmp_file, "w") as f_out:
                     for line in f_in:
-                        if line.strip() == target_val:
+                        clean_line = line.replace("\r", "").strip()
+                        if clean_line == target_val:
                             found = True
                         else:
-                            f_out.write(line)
+                            f_out.write(line.replace("\r", ""))
                 os.replace(tmp_file, data_file)
                 
                 if found:
@@ -412,10 +463,10 @@ LOG_FILE = os.path.join("db_manage", "secrets", "backup_schedule.log")
 while True:
     time.sleep(INTERVAL)
     timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
-    os.makedirs("backups", exist_ok=True)
+    os.makedirs("db_manage/backups", exist_ok=True)
     if FUNC_NAME == "backup":
         bname = f"auto-{timestamp}"
-        subprocess.run(["tar", "-czf", f"backups/{bname}.tar.gz", "db_manage"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["tar", "-czf", f"db_manage/backups/{bname}.tar.gz", "db_manage"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     elif FUNC_NAME == "backup_delete":
         config_file = os.path.join("db_manage", "secrets", "backup_configs.cfg")
         max_backups = 10
@@ -434,7 +485,7 @@ while True:
                             max_backups = int(line.split("=")[1].strip())
             except Exception:
                 pass
-        backup_files = sorted(glob.glob(os.path.join("backups", "*.tar.gz")), key=os.path.getmtime)
+        backup_files = sorted(glob.glob(os.path.join("db_manage", "backups", "*.tar.gz")), key=os.path.getmtime)
         while len(backup_files) > max_backups:
             oldest = backup_files.pop(0)
             try:
@@ -535,25 +586,24 @@ if not os.path.exists(cols_file):
     print("Error: Table columns not found.")
     sys.exit(1)
 with open(cols_file, "r") as f:
-    header = [c.strip().replace("\n", " ").replace("\r", "") for c in f if c.strip()]
+    header = [c.replace("\r", "").strip().replace("\n", " ") for c in f if c.strip()]
 if not header:
     header = ["id"]
 rows_data = []
 if os.path.exists(data_file):
     with open(data_file, "r") as f:
-        rows_data = [line.strip() for line in f if line.strip()]
+        rows_data = [line.replace("\r", "").strip() for line in f if line.strip()]
 
 num_cols = len(header)
 rows = [header]
 for line in rows_data:
-    r = [c.strip().replace("\n", " ").replace("\r", "") for c in line.split("|")]
+    r = [c.strip().replace("\n", " ").replace("\r", "") for c in line.split(" ")]
     while len(r) < num_cols:
         r.append("")
     rows.append(r[:num_cols])
 
 if len(rows) == 1:
-    print("  (Table is empty)")
-    sys.exit(0)
+    rows.append(["" for _ in range(num_cols)])
 
 col_widths = [max(len(row[i]) for row in rows) for i in range(num_cols)]
 col_widths = [max(w, 4) for w in col_widths]
@@ -564,7 +614,7 @@ def print_row(row, widths, is_header=False):
             padded = val.center(widths[i])
             cell_str = f"\033[1;32m{padded}\033[0m"
         else:
-            padded = val.ljust(widths[i])
+            padded = val.center(widths[i])
             cell_str = padded
         formatted.append(cell_str)
     return "│ " + " │ ".join(formatted) + " │"
@@ -593,7 +643,7 @@ if not os.path.exists(cols_file):
     print("  (No columns found)")
     sys.exit(0)
 with open(cols_file, "r") as f:
-    cols = [c.strip() for c in f if c.strip()]
+    cols = [c.replace("\r", "").strip() for c in f if c.strip()]
 if not cols:
     print("  (No columns found)")
     sys.exit(0)
@@ -700,6 +750,8 @@ while true; do
                 printf '%b' "   ${CYAN}backup_schedule <func> <true|false> <val>${NC} ${GRAY}- Automate backup functions${NC}\n"
                 printf '%b' "   ${CYAN}backup_configs <cfg> <val>${NC}      ${GRAY}- Show/Configure backup categories${NC}\n\n"
                 printf '%b' " ${YELLOW}[ 🛠 SYSTEM ]${NC}\n"
+                printf '%b' "   ${CYAN}system_terminate [--force]${NC}        ${GRAY}- Terminate processes and clean db_manage${NC}\n"
+                printf '%b' "   ${CYAN}system_process [kill <process>]${NC}   ${GRAY}- List or terminate system processes${NC}\n"
                 printf '%b' "   ${CYAN}clear${NC}                             ${GRAY}- Clear screen${NC}\n"
                 printf '%b' "   ${CYAN}help${NC}                              ${GRAY}- Show help menu${NC}\n"
                 printf '%b' "   ${CYAN}exit / quit${NC}                       ${GRAY}- Exit application${NC}\n\n"
@@ -708,10 +760,161 @@ while true; do
             "clear")
                 show_banner
                 ;;
-            "backup")
+            "system_terminate")
+                OLD_IFS="$IFS"
+                IFS='&'
                 set -- $args
+                IFS="$OLD_IFS"
+                force_arg="$1"
+                force_arg=$(echo "$force_arg" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                
+                if ! confirm_action "$force_arg" "Terminate all system processes and delete the 'db_manage' directory"; then
+                    echo ""
+                    continue
+                fi
+                
+                if [ -d "db_manage/secrets" ]; then
+                    for pid_f in db_manage/secrets/backup_*.pid; do
+                        [ -f "$pid_f" ] || continue
+                        p=$(cat "$pid_f" 2>/dev/null)
+                        [ -n "$p" ] && kill "$p" 2>/dev/null
+                        rm -f "$pid_f"
+                    done
+                fi
+                if [ -d "db_manage/database" ]; then
+                    for db_dir in db_manage/database/*; do
+                        [ -d "$db_dir" ] || continue
+                        for api_type in public secret; do
+                            pid_file="$db_dir/api/$api_type/api.pid"
+                            if [ -f "$pid_file" ]; then
+                                pid=$(cat "$pid_file" 2>/dev/null)
+                                [ -n "$pid" ] && kill "$pid" 2>/dev/null
+                                rm -f "$pid_file"
+                            fi
+                        done
+                    done
+                fi
+                pkill -f "python3.*server.py" 2>/dev/null
+                
+                rm -rf db_manage
+                CURRENT_DB="none"
+                
+                mkdir -p db_manage/database db_manage/secrets db_manage/backups
+                [ -e "db_manage/secrets/secrets.env" ] || touch "db_manage/secrets/secrets.env"
+                [ -e "db_manage/secrets/database.cfg" ] || touch "db_manage/secrets/database.cfg"
+                [ -e "db_manage/secrets/api.cfg" ] || touch "db_manage/secrets/api.cfg"
+                [ -e "db_manage/secrets/backup_configs.cfg" ] || touch "db_manage/secrets/backup_configs.cfg"
+                [ -e "db_manage/secrets/backup_schedule.cfg" ] || touch "db_manage/secrets/backup_schedule.cfg"
+                init_backup_configs_file "db_manage/secrets/backup_configs.cfg"
+                init_backup_schedule_file "db_manage/secrets/backup_schedule.cfg"
+                
+                printf '%b' "${GREEN}System terminated successfully. All processes were terminated and db_manage directory was cleaned/recreated.${NC}\n"
+                echo ""
+                ;;
+            "system_process")
+                OLD_IFS="$IFS"
+                IFS='&'
+                set -- $args
+                IFS="$OLD_IFS"
+                sp_action="$1"
+                sp_target="$2"
+                sp_action=$(echo "$sp_action" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                sp_target=$(echo "$sp_target" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+                if [ -z "$sp_action" ]; then
+                    printf '%b' "${CYAN}${BOLD}System Managed Processes:${NC}\n"
+                    has_procs=0
+                    if [ -d "db_manage/secrets" ]; then
+                        for pid_f in db_manage/secrets/backup_*.pid; do
+                            [ -f "$pid_f" ] || continue
+                            proc_name=$(basename "$pid_f" .pid | sed 's/^backup_//')
+                            p=$(cat "$pid_f" 2>/dev/null)
+                            status_val="${RED}Stopped${NC}"
+                            if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+                                status_val="${GREEN}Running${NC}"
+                                pid_disp="${GREEN}PID: $p${NC}"
+                                has_procs=1
+                            else
+                                pid_disp="${RED}Stopped${NC}"
+                                rm -f "$pid_f"
+                            fi
+                            printf '%b' "  - ${CYAN}Backup Process:${NC} ${YELLOW}${proc_name}${NC} -> Status: ${status_val}, Process: ${pid_disp}\n"
+                        done
+                    fi
+                    if [ -d "db_manage/database" ]; then
+                        for db_d in db_manage/database/*; do
+                            [ -d "$db_d" ] || continue
+                            dbname=$(basename "$db_d")
+                            for api_t in public secret; do
+                                pid_f="$db_d/api/$api_t/api.pid"
+                                [ -f "$pid_f" ] || continue
+                                p=$(cat "$pid_f" 2>/dev/null)
+                                status_val="${RED}Stopped${NC}"
+                                if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+                                    status_val="${GREEN}Running${NC}"
+                                    pid_disp="${GREEN}PID: $p${NC}"
+                                    has_procs=1
+                                else
+                                    pid_disp="${RED}Stopped${NC}"
+                                    rm -f "$pid_f"
+                                fi
+                                printf '%b' "  - ${CYAN}API Server (${api_t}):${NC} Database: ${YELLOW}${dbname}${NC} -> Status: ${status_val}, Process: ${pid_disp}\n"
+                            done
+                        done
+                    fi
+                    [ "$has_procs" -eq 0 ] && printf '%b' "  (No active managed processes found)\n"
+                elif [ "$sp_action" = "kill" ]; then
+                    if [ -z "$sp_target" ]; then
+                        printf '%b' "${RED}Error: Process identifier or PID required. Usage: system_process kill <process|pid>${NC}\n"
+                    else
+                        killed=0
+                        if echo "$sp_target" | grep -q '^[0-9]\+$'; then
+                            if kill -0 "$sp_target" 2>/dev/null; then
+                                kill "$sp_target" 2>/dev/null || kill -9 "$sp_target" 2>/dev/null
+                                killed=1
+                            fi
+                        fi
+                        if [ -f "db_manage/secrets/backup_${sp_target}.pid" ]; then
+                            p=$(cat "db_manage/secrets/backup_${sp_target}.pid" 2>/dev/null)
+                            [ -n "$p" ] && kill "$p" 2>/dev/null
+                            rm -f "db_manage/secrets/backup_${sp_target}.pid"
+                            killed=1
+                        fi
+                        for db_d in db_manage/database/*; do
+                            [ -d "$db_d" ] || continue
+                            dbname=$(basename "$db_d")
+                            for api_t in public secret; do
+                                pid_f="$db_d/api/$api_t/api.pid"
+                                if [ -f "$pid_f" ]; then
+                                    p=$(cat "$pid_f" 2>/dev/null)
+                                    if [ "$dbname" = "$sp_target" ] || [ "${dbname}-${api_t}" = "$sp_target" ] || [ "$p" = "$sp_target" ]; then
+                                        [ -n "$p" ] && kill "$p" 2>/dev/null
+                                        rm -f "$pid_f"
+                                        killed=1
+                                    fi
+                                fi
+                            done
+                        done
+                        if [ "$killed" -eq 1 ]; then
+                            printf '%b' "${GREEN}Process '$sp_target' terminated successfully.${NC}\n"
+                        else
+                            printf '%b' "${RED}Error: Process '$sp_target' not found or could not be terminated.${NC}\n"
+                        fi
+                    fi
+                else
+                    printf '%b' "${RED}Error: Invalid action. Usage: system_process [kill <process>]${NC}\n"
+                fi
+                echo ""
+                ;;
+            "backup")
+                OLD_IFS="$IFS"
+                IFS='&'
+                set -- $args
+                IFS="$OLD_IFS"
                 bname="$1"
                 force_arg="$2"
+                bname=$(echo "$bname" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                force_arg=$(echo "$force_arg" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
                 [ "$bname" = "--force" ] && { force_arg="--force"; bname=""; }
                 if [ -z "$bname" ]; then
                     def_prefix="auto"
@@ -722,7 +925,7 @@ while true; do
                     bname="${def_prefix}-$(date +%Y-%m-%d_%H-%M-%S)"
                 fi
                 
-                bfile="backups/$bname.tar.gz"
+                bfile="db_manage/backups/$bname.tar.gz"
                 if [ -e "$bfile" ]; then
                     if ! confirm_action "$force_arg" "Backup '$bname' already exists and will be overwritten"; then
                         echo ""
@@ -730,16 +933,16 @@ while true; do
                     fi
                 fi
                 
-                mkdir -p backups
+                mkdir -p db_manage/backups
                 tar -czf "$bfile" db_manage 2>/dev/null
-                printf '%b' "${GREEN}Backup '$bname' created successfully in 'backups/'.${NC}\n"
+                printf '%b' "${GREEN}Backup '$bname' created successfully in 'db_manage/backups/'.${NC}\n"
                 echo ""
                 ;;
             "backups")
                 printf '%b' "${CYAN}${BOLD}Available Backups:${NC}\n"
                 python3 -c '
 import os, glob
-b_dir = "backups"
+b_dir = "db_manage/backups"
 if not os.path.exists(b_dir):
     print("  (No backups found)")
 else:
@@ -763,13 +966,18 @@ else:
                 echo ""
                 ;;
             "backup_restore")
+                OLD_IFS="$IFS"
+                IFS='&'
                 set -- $args
+                IFS="$OLD_IFS"
                 bname="$1"
                 force_arg="$2"
+                bname=$(echo "$bname" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                force_arg=$(echo "$force_arg" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
                 if [ -z "$bname" ]; then
                     printf '%b' "${RED}Error: Backup name required. Usage: backup_restore <backup-name> [--force]${NC}\n"
                 else
-                    bfile="backups/$bname.tar.gz"
+                    bfile="db_manage/backups/$bname.tar.gz"
                     if [ ! -e "$bfile" ]; then
                         printf '%b' "${RED}Error: Backup '$bname' does not exist.${NC}\n"
                     else
@@ -796,19 +1004,24 @@ else:
                         done
                         pkill -f "python3.*server.py" 2>/dev/null
                         tar -xzf "$bfile" 2>/dev/null
-                        printf '%b' "${GREEN}Todos os servidores Python foram encerrados e o backup '$bname' foi restaurado com sucesso.${NC}\n"
+                        printf '%b' "${GREEN}All Python servers were terminated and backup '$bname' was restored successfully.${NC}\n"
                     fi
                 fi
                 echo ""
                 ;;
             "backup_delete")
+                OLD_IFS="$IFS"
+                IFS='&'
                 set -- $args
+                IFS="$OLD_IFS"
                 bname="$1"
                 force_arg="$2"
+                bname=$(echo "$bname" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                force_arg=$(echo "$force_arg" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
                 if [ -z "$bname" ]; then
                     printf '%b' "${RED}Error: Backup name required. Usage: backup_delete <backup-name> [--force]${NC}\n"
                 else
-                    bfile="backups/$bname.tar.gz"
+                    bfile="db_manage/backups/$bname.tar.gz"
                     if [ ! -e "$bfile" ]; then
                         printf '%b' "${RED}Error: Backup '$bname' does not exist.${NC}\n"
                     else
@@ -825,9 +1038,14 @@ else:
             "backup_configs")
                 cfg_file="db_manage/secrets/backup_configs.cfg"
                 init_backup_configs_file "$cfg_file"
+                OLD_IFS="$IFS"
+                IFS='&'
                 set -- $args
+                IFS="$OLD_IFS"
                 c_key="$1"
                 c_val="$2"
+                c_key=$(echo "$c_key" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                c_val=$(echo "$c_val" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
                 if [ -z "$c_key" ]; then
                     printf '%b' "${CYAN}${BOLD}Categorized Backup System Configurations:${NC}\n"
                     curr_cat=""
@@ -882,10 +1100,16 @@ else:
             "backup_schedule")
                 s_file="db_manage/secrets/backup_schedule.cfg"
                 init_backup_schedule_file "$s_file"
+                OLD_IFS="$IFS"
+                IFS='&'
                 set -- $args
+                IFS="$OLD_IFS"
                 s_func="$1"
                 s_status="$2"
                 s_val="$3"
+                s_func=$(echo "$s_func" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                s_status=$(echo "$s_status" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                s_val=$(echo "$s_val" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
 
                 if [ -z "$s_func" ]; then
                     printf '%b' "${CYAN}${BOLD}Backup Schedule Functions:${NC}\n"
@@ -1023,8 +1247,13 @@ else:
                 IFS='&'
                 set -- $args
                 IFS="$OLD_IFS"
-                old_name="$1"
-                new_name="$2"
+                old_name=$(echo "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                new_name=$(echo "$2" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                if [ -z "$new_name" ]; then
+                    set -- $args
+                    old_name="$1"
+                    new_name="$2"
+                fi
                 if [ -z "$old_name" ] || [ -z "$new_name" ]; then
                     printf '%b' "${RED}Error: Usage: rename_database <name> <newname>${NC}\n"
                 elif [ ! -d "db_manage/database/$old_name" ]; then
@@ -1154,6 +1383,13 @@ else:
                     IFS="$OLD_IFS"
                     old_tbl="$1"
                     new_tbl="$2"
+                    old_tbl=$(echo "$old_tbl" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                    new_tbl=$(echo "$new_tbl" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                    if [ -z "$new_tbl" ]; then
+                        set -- $args
+                        old_tbl="$1"
+                        new_tbl="$2"
+                    fi
                     if [ -z "$old_tbl" ] || [ -z "$new_tbl" ]; then
                         printf '%b' "${RED}Error: Usage: rename_table <name> <newname>${NC}\n"
                     elif [ ! -e "db_manage/database/${CURRENT_DB}/tables/$old_tbl" ]; then
@@ -1173,8 +1409,10 @@ else:
                 elif [ -z "$args" ]; then
                     printf '%b' "${RED}Error: Usage: create_column <tbl> <col>${NC}\n"
                 else
-                    set -- $args
+                    args_clean=$(echo "$args" | tr '&' ' ')
+                    set -- $args_clean
                     tbl_name="$1"
+                    tbl_name=$(echo "$tbl_name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
                     if [ -z "$tbl_name" ]; then
                         printf '%b' "${RED}Error: Usage: create_column <tbl> <col>${NC}\n"
                     elif [ ! -e "db_manage/database/${CURRENT_DB}/tables/$tbl_name" ]; then
@@ -1197,7 +1435,7 @@ data_file = os.path.join(tbl_dir, "tables")
 if not os.path.exists(cols_file):
     sys.exit(1)
 with open(cols_file, "r") as f:
-    cols = [c.strip() for c in f if c.strip()]
+    cols = [c.replace("\r", "").strip() for c in f if c.strip()]
 if col_name in cols:
     sys.exit(0)
 cols.append(col_name)
@@ -1206,14 +1444,14 @@ with open(cols_file, "w") as f:
         f.write(c + "\n")
 if os.path.exists(data_file):
     with open(data_file, "r") as f:
-        lines = [line.rstrip("\n\r") for line in f if line.strip()]
+        lines = [line.replace("\r", "").strip() for line in f if line.strip()]
     new_lines = []
     for line in lines:
-        parts = [c.strip() for c in line.split("|")]
+        parts = [c.strip() for c in line.split(" ")]
         while len(parts) < len(cols) - 1:
             parts.append("")
         parts.append("")
-        new_lines.append(" | ".join(parts))
+        new_lines.append(" ".join(parts))
     with open(data_file, "w") as f:
         for l in new_lines:
             f.write(l + "\n")
@@ -1229,9 +1467,14 @@ if os.path.exists(data_file):
                 if [ "$CURRENT_DB" = "none" ]; then
                     printf '%b' "${RED}Error: No active database. Use 'use <name>' first.${NC}\n"
                 else
+                    OLD_IFS="$IFS"
+                    IFS='&'
                     set -- $args
+                    IFS="$OLD_IFS"
                     tbl_name="$1"
                     col_name="$2"
+                    tbl_name=$(echo "$tbl_name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                    col_name=$(echo "$col_name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
                     if [ -z "$tbl_name" ] || [ -z "$col_name" ]; then
                         printf '%b' "${RED}Error: Usage: drop_column <tbl> <col>${NC}\n"
                     elif [ ! -e "db_manage/database/${CURRENT_DB}/tables/$tbl_name" ]; then
@@ -1248,7 +1491,7 @@ if not os.path.exists(cols_file):
     print("Error: Table not found.")
     sys.exit(1)
 with open(cols_file, "r") as f:
-    cols = [c.strip() for c in f if c.strip()]
+    cols = [c.replace("\r", "").strip() for c in f if c.strip()]
 if col_name not in cols:
     print(f"Error: Column '\''{col_name}'\'' not found.")
     sys.exit(1)
@@ -1262,14 +1505,14 @@ with open(cols_file, "w") as f:
         f.write(c + "\n")
 if os.path.exists(data_file):
     with open(data_file, "r") as f:
-        lines = [line.strip() for line in f if line.strip()]
+        lines = [line.replace("\r", "").strip() for line in f if line.strip()]
     new_lines = []
     for line in lines:
-        parts = [c.strip() for c in line.split("|")]
+        parts = [c.strip() for c in line.split(" ")]
         while len(parts) <= col_idx:
             parts.append("")
         parts.pop(col_idx)
-        new_lines.append(" | ".join(parts))
+        new_lines.append(" ".join(parts))
     with open(data_file, "w") as f:
         for l in new_lines:
             f.write(l + "\n")
@@ -1295,6 +1538,7 @@ print("SUCCESS")
                     set -- $args
                     IFS="$OLD_IFS"
                     tbl_name="$1"
+                    tbl_name=$(echo "$tbl_name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
                     if [ -z "$tbl_name" ]; then
                         printf '%b' "${RED}Error: Usage: show_columns <tbl>${NC}\n"
                     elif [ ! -e "db_manage/database/${CURRENT_DB}/tables/$tbl_name" ]; then
@@ -1315,10 +1559,16 @@ print("SUCCESS")
                 if [ "$CURRENT_DB" = "none" ]; then
                     printf '%b' "${RED}Error: No active database. Use 'use <name>' first.${NC}\n"
                 else
+                    OLD_IFS="$IFS"
+                    IFS='&'
                     set -- $args
+                    IFS="$OLD_IFS"
                     tbl_name="$1"
                     old_col="$2"
                     new_col="$3"
+                    tbl_name=$(echo "$tbl_name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                    old_col=$(echo "$old_col" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                    new_col=$(echo "$new_col" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
                     if [ -z "$tbl_name" ] || [ -z "$old_col" ] || [ -z "$new_col" ]; then
                         printf '%b' "${RED}Error: Usage: rename_column <tbl> <col> <newcol>${NC}\n"
                     elif [ ! -e "db_manage/database/${CURRENT_DB}/tables/$tbl_name" ]; then
@@ -1329,7 +1579,7 @@ print("SUCCESS")
                         found=0
                         temp_cols="$cols_file.tmp"
                         while IFS= read -r col || [ -n "$col" ]; do
-                            col=$(echo "$col" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                            col=$(echo "$col" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/\r//g')
                             [ -z "$col" ] && continue
                             if [ "$col" = "$old_col" ]; then
                                 echo "$new_col" >> "$temp_cols"
@@ -1380,9 +1630,9 @@ print("SUCCESS")
                     set -- $args
                     IFS="$OLD_IFS"
                     target_tbl="$1"
+                    target_tbl=$(echo "$target_tbl" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
                     
                     if [ -n "$target_tbl" ]; then
-                        target_tbl=$(echo "$target_tbl" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
                         tbl_dir="db_manage/database/${CURRENT_DB}/tables/$target_tbl"
                         if [ -e "$tbl_dir" ]; then
                             printf '%b' "${CYAN}${BOLD}Complete Table View: '$target_tbl'${NC}\n"
@@ -1459,58 +1709,104 @@ data_file = os.path.join(tbl_dir, "tables")
 if not os.path.exists(cols_file):
     sys.exit(1)
 with open(cols_file, "r") as f:
-    header = [c.strip() for c in f if c.strip()]
+    header = [c.replace("\r", "").strip() for c in f if c.strip()]
 if not header:
     header = ["id"]
+num_cols = len(header)
 
-rows_count = 0
+lines = []
 if os.path.exists(data_file):
     with open(data_file, "r") as f:
-        rows_count = sum(1 for line in f if line.strip())
+        lines = [line.replace("\r", "").strip() for line in f if line.strip()]
 
-num_cols = len(header)
-next_id = str(rows_count + 1)
-row_data = [""] * num_cols
-if header and header[0] == "id":
-    row_data[0] = next_id
+rows = []
+for line in lines:
+    parts = [p.strip().replace("\n", " ").replace("\r", "") for p in line.split(" ")]
+    while len(parts) < num_cols:
+        parts.append("")
+    rows.append(parts[:num_cols])
 
+target_map = {}
 if len(args) >= 2 and args[0] in header:
     i = 0
     while i < len(args) - 1:
         col = args[i]
         val = args[i+1]
         if col in header and col != "id":
-            row_data[header.index(col)] = val
+            target_map[header.index(col)] = str(val).replace("\n", " ").replace("\r", "")
             i += 2
         else:
             i += 1
 elif len(args) == 1 and "|" in args[0]:
     parts = [p.strip().replace("\n", " ").replace("\r", "") for p in args[0].split("|")]
-    if header and header[0] == "id":
-        parts = [next_id] + [p for i, p in enumerate(parts) if i > 0]
-    while len(parts) < num_cols:
-        parts.append("")
-    row_data = parts[:num_cols]
+    start_idx = 1 if (header and header[0] == "id") else 0
+    for idx, p in enumerate(parts):
+        c_idx = start_idx + idx
+        if c_idx < num_cols:
+            target_map[c_idx] = p
 else:
     joined = " ".join(args)
     if "|" in joined:
         parts = [p.strip().replace("\n", " ").replace("\r", "") for p in joined.split("|")]
-        if header and header[0] == "id":
-            parts = [next_id] + [p for i, p in enumerate(parts) if i > 0]
-        while len(parts) < num_cols:
-            parts.append("")
-        row_data = parts[:num_cols]
-    elif len(args) == 1 and num_cols > 1:
-        row_data[1] = args[0]
+        start_idx = 1 if (header and header[0] == "id") else 0
+        for idx, p in enumerate(parts):
+            c_idx = start_idx + idx
+            if c_idx < num_cols:
+                target_map[c_idx] = p
     elif len(args) >= 1 and num_cols > 1:
-        row_data[1] = args[0]
+        if args[0] in header and len(args) >= 2:
+            i = 0
+            while i < len(args) - 1:
+                col = args[i]
+                val = args[i+1]
+                if col in header and col != "id":
+                    target_map[header.index(col)] = str(val).replace("\n", " ").replace("\r", "")
+                    i += 2
+                else:
+                    i += 1
+        else:
+            start_idx = 1 if (header and header[0] == "id") else 0
+            for idx, p in enumerate(args):
+                c_idx = start_idx + idx
+                if c_idx < num_cols:
+                    target_map[c_idx] = str(p).replace("\n", " ").replace("\r", "")
 
-row_data = [str(v).replace("\n", " ").replace("\r", "") for v in row_data]
-new_row = " | ".join(row_data)
-with open(data_file, "a") as f:
-    f.write(new_row + "\n")
+target_row_idx = -1
+if target_map:
+    for r_idx, r in enumerate(rows):
+        is_empty = True
+        for c_idx in target_map:
+            if r[c_idx] != "":
+                is_empty = False
+                break
+        if is_empty:
+            target_row_idx = r_idx
+            break
+
+if target_row_idx != -1:
+    for c_idx, val in target_map.items():
+        rows[target_row_idx][c_idx] = val
+    inserted_row = rows[target_row_idx]
+else:
+    new_row = [""] * num_cols
+    if header and header[0] == "id":
+        new_row[0] = str(len(rows) + 1)
+    for c_idx, val in target_map.items():
+        new_row[c_idx] = val
+    rows.append(new_row)
+    inserted_row = new_row
+
+with open(data_file, "w") as f:
+    for r in rows:
+        f.write(" ".join(r) + "\n")
+
+tbl_name = os.path.basename(tbl_dir)
+inserted_cols = [header[i] for i in target_map.keys()]
+inserted_vals = [target_map[i] for i in target_map.keys()]
+cols_str = ", ".join(inserted_cols) if inserted_cols else ", ".join(header)
+vals_str = ", ".join(inserted_vals) if inserted_vals else ", ".join(inserted_row)
+print(f"\033[0;32mTable '\''{tbl_name}'\'', column '\''{cols_str}'\'': inserted data '\''{vals_str}'\''.\033[0m")
 ' "$tbl_dir" "$@"
-                        printf '%b' "${GREEN}Data inserted into table '$tblname'.${NC}\n"
                     done
                 fi
                 echo ""
@@ -1551,6 +1847,10 @@ with open(data_file, "a") as f:
                     col_name="$2"
                     content="$3"
                     newcontent="$4"
+                    tbl_name=$(echo "$tbl_name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                    col_name=$(echo "$col_name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                    content=$(echo "$content" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                    newcontent=$(echo "$newcontent" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
                     if [ -z "$tbl_name" ] || [ -z "$col_name" ] || [ -z "$content" ] || [ -z "$newcontent" ]; then
                         printf '%b' "${RED}Error: Usage: update <tbl> <col> <val> <newval>${NC}\n"
                     elif [ ! -e "db_manage/database/${CURRENT_DB}/tables/$tbl_name" ]; then
@@ -1563,7 +1863,7 @@ with open(data_file, "a") as f:
                         col_idx=-1
                         curr_idx=1
                         while IFS= read -r col || [ -n "$col" ]; do
-                            col=$(echo "$col" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                            col=$(echo "$col" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/\r//g')
                             [ -z "$col" ] && continue
                             if [ "$col" = "$col_name" ]; then
                                 col_idx="$curr_idx"
@@ -1578,23 +1878,25 @@ with open(data_file, "a") as f:
                             tmp_file="$data_file.tmp"
                             updated_count=0
                             while IFS= read -r line || [ -n "$line" ]; do
-                                row_line="$line"
+                                row_line=$(echo "$line" | tr -d '\r')
                                 row_idx=1
                                 new_row=""
                                 OLD_IFS2="$IFS"
-                                IFS='|'
+                                IFS=' '
                                 set -- $row_line
                                 IFS="$OLD_IFS2"
                                 for val in "$@"; do
                                     val_trimmed=$(echo "$val" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
                                     if [ "$row_idx" -eq "$col_idx" ] && [ "$val_trimmed" = "$content" ]; then
-                                        val=" $(echo "$newcontent" | tr '\n' ' ' | tr '\r' ' ') "
+                                        val_clean=$(echo "$newcontent" | tr '\n' ' ' | tr '\r' ' ' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
                                         updated_count=$(expr "$updated_count" + 1)
+                                    else
+                                        val_clean="$val_trimmed"
                                     fi
                                     if [ -z "$new_row" ]; then
-                                        new_row="$val"
+                                        new_row="$val_clean"
                                     else
-                                        new_row="$new_row | $val"
+                                        new_row="$new_row $val_clean"
                                     fi
                                     row_idx=$(expr "$row_idx" + 1)
                                 done
@@ -1670,7 +1972,7 @@ with open(data_file, "a") as f:
                             col_idx=-1
                             curr_idx=1
                             while IFS= read -r col || [ -n "$col" ]; do
-                                col=$(echo "$col" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                                col=$(echo "$col" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/\r//g')
                                 [ -z "$col" ] && continue
                                 if [ "$col" = "$col_name" ]; then
                                     col_idx="$curr_idx"
@@ -1685,10 +1987,11 @@ with open(data_file, "a") as f:
                                 tmp_file="$data_file.tmp"
                                 found=0
                                 while IFS= read -r row || [ -n "$row" ]; do
+                                    row=$(echo "$row" | tr -d '\r')
                                     row_idx=1
                                     match=0
                                     OLD_IFS2="$IFS"
-                                    IFS='|'
+                                    IFS=' '
                                     set -- $row
                                     IFS="$OLD_IFS2"
                                     for val in "$@"; do
@@ -1723,6 +2026,7 @@ with open(data_file, "a") as f:
                                 tmp_file="$data_file.tmp"
                                 found=0
                                 while IFS= read -r row || [ -n "$row" ]; do
+                                    row=$(echo "$row" | tr -d '\r')
                                     if [ "$row" = "$target" ]; then
                                         found=1
                                     else
@@ -1750,9 +2054,14 @@ with open(data_file, "a") as f:
                     perm_file="db_manage/database/${CURRENT_DB}/api/public/permissions.cfg"
                     init_permissions_file "$perm_file"
 
+                    OLD_IFS="$IFS"
+                    IFS='&'
                     set -- $args
+                    IFS="$OLD_IFS"
                     p_name="$1"
                     p_val="$2"
+                    p_name=$(echo "$p_name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                    p_val=$(echo "$p_val" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
 
                     if [ -z "$p_name" ]; then
                         printf '%b' "${CYAN}${BOLD}Public API Permissions for '$CURRENT_DB':${NC}\n"
@@ -1812,6 +2121,7 @@ with open(data_file, "a") as f:
                     set -- $args
                     IFS="$OLD_IFS"
                     api_type="$1"
+                    api_type=$(echo "$api_type" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
                     [ -z "$api_type" ] && api_type="public"
                     if [ "$api_type" != "public" ] && [ "$api_type" != "secret" ]; then
                         printf '%b' "${RED}Error: Invalid API type.${NC}\n"
@@ -1884,6 +2194,7 @@ EOF
                     set -- $args
                     IFS="$OLD_IFS"
                     api_type="$1"
+                    api_type=$(echo "$api_type" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
                     [ -z "$api_type" ] && api_type="public"
                     if [ "$api_type" != "public" ] && [ "$api_type" != "secret" ]; then
                         printf '%b' "${RED}Error: Invalid API type.${NC}\n"
@@ -1978,6 +2289,7 @@ EOF
                     set -- $args
                     IFS="$OLD_IFS"
                     api_type="$1"
+                    api_type=$(echo "$api_type" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
                     [ -z "$api_type" ] && api_type="public"
                     if [ "$api_type" != "public" ] && [ "$api_type" != "secret" ]; then
                         printf '%b' "${RED}Error: Invalid API type.${NC}\n"
@@ -2037,6 +2349,7 @@ EOF
                     set -- $args
                     IFS="$OLD_IFS"
                     api_type="$1"
+                    api_type=$(echo "$api_type" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
                     [ -n "$api_type" ] && shift
                     [ -z "$api_type" ] && api_type="public"
                     
@@ -2047,11 +2360,12 @@ EOF
                         printf '%b' "${YELLOW}API is not currently running.${NC}\n"
                     else
                         pid=$(cat "$pid_file" 2>/dev/null)
-                        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-                            kill "$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null
+                        if [ -n "$pid" ] && kill "$pid" 2>/dev/null; then
+                            printf '%b' "${GREEN}API server stopped successfully.${NC}\n"
+                        else
+                            printf '%b' "${RED}Error: Failed to stop API server or process not running.${NC}\n"
                         fi
                         rm -f "$pid_file"
-                        printf '%b' "${GREEN}API server stopped successfully.${NC}\n"
                     fi
                 fi
                 echo ""
@@ -2065,21 +2379,23 @@ EOF
                     set -- $args
                     IFS="$OLD_IFS"
                     api_type="$1"
+                    api_type=$(echo "$api_type" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
                     [ -z "$api_type" ] && api_type="public"
+                    if [ "$api_type" != "public" ] && [ "$api_type" != "secret" ]; then
+                        printf '%b' "${RED}Error: Invalid API type.${NC}\n"
+                        echo ""
+                        continue
+                    fi
 
                     api_dir="db_manage/database/${CURRENT_DB}/api/$api_type"
                     pid_file="$api_dir/api.pid"
-
-                    if [ -d "$api_dir" ]; then
-                        if [ -f "$pid_file" ]; then
-                            pid=$(cat "$pid_file" 2>/dev/null)
-                            [ -n "$pid" ] && kill "$pid" 2>/dev/null
-                        fi
-                        rm -rf "$api_dir"
-                        printf '%b' "${GREEN}API configuration deleted successfully.${NC}\n"
-                    else
-                        printf '%b' "${YELLOW}API configuration does not exist.${NC}\n"
+                    if [ -f "$pid_file" ]; then
+                        pid=$(cat "$pid_file" 2>/dev/null)
+                        [ -n "$pid" ] && kill "$pid" 2>/dev/null
+                        rm -f "$pid_file"
                     fi
+                    rm -rf "$api_dir"
+                    printf '%b' "${GREEN}API ($api_type) deleted successfully.${NC}\n"
                 fi
                 echo ""
                 ;;
@@ -2092,108 +2408,15 @@ EOF
                     set -- $args
                     IFS="$OLD_IFS"
                     api_type="$1"
+                    api_type=$(echo "$api_type" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
                     [ -z "$api_type" ] && api_type="public"
-
+                    
                     api_dir="db_manage/database/${CURRENT_DB}/api/$api_type"
-                    api_cfg="$api_dir/api.cfg"
                     pid_file="$api_dir/api.pid"
-
-                    if [ ! -f "$api_cfg" ]; then
-                        printf '%b' "${RED}Error: API is not configured.${NC}\n"
+                    if [ -f "$pid_file" ] && kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null; then
+                        printf '%b' "${GREEN}API ($api_type) is running (PID: $(cat "$pid_file")).${NC}\n"
                     else
-                        api_name_val=$(grep "^Name=" "$api_cfg" 2>/dev/null | cut -d'=' -f2)
-                        api_proto_val=$(grep "^Protocol=" "$api_cfg" 2>/dev/null | cut -d'=' -f2)
-                        api_addr_val=$(grep "^Address=" "$api_cfg" 2>/dev/null | cut -d'=' -f2)
-                        api_port_val=$(grep "^Port=" "$api_cfg" 2>/dev/null | cut -d'=' -f2)
-                        api_debug_val=$(grep "^ApiDebug=" "$api_cfg" 2>/dev/null | cut -d'=' -f2)
-                        api_type_upper=$(echo "$api_type" | tr '[:lower:]' '[:upper:]')
-                        
-                        printf '%b' "${CYAN}==================================================${NC}\n"
-                        printf '%b' "${CYAN}${BOLD}     API STATUS: ${api_name_val:-$CURRENT_DB}       ${NC}\n"
-                        printf '%b' "${CYAN}==================================================${NC}\n"
-                        printf '%b' " Database: ${GREEN}$CURRENT_DB${NC}\n"
-                        printf '%b' " Type:     ${BLUE}$api_type_upper${NC}\n"
-                        printf '%b' " Protocol: ${YELLOW}${api_proto_val:-http}${NC}\n"
-                        printf '%b' " Address:  ${CYAN}${api_addr_val:-localhost}${NC}\n"
-                        printf '%b' " Port:     ${CYAN}${api_port_val:-8080}${NC}\n"
-                        printf '%b' " Debug:    ${CYAN}${api_debug_val:-true}${NC}\n"
-                        
-                        is_running=0
-                        if [ -f "$pid_file" ]; then
-                            pid=$(cat "$pid_file" 2>/dev/null)
-                            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-                                is_running=1
-                                printf '%b' " Status:   ${GREEN}RUNNING${NC} (PID: ${pid})\n"
-                            else
-                                rm -f "$pid_file"
-                            fi
-                        fi
-                        [ "$is_running" -eq 0 ] && printf '%b' " Status:   ${RED}STOPPED${NC}\n"
-                        printf '%b' "${CYAN}==================================================${NC}\n"
-                    fi
-                fi
-                echo ""
-                ;;
-            "api_request")
-                if [ "$CURRENT_DB" = "none" ]; then
-                    printf '%b' "${RED}Error: No active database. Use 'use <name>' first.${NC}\n"
-                elif [ -z "$args" ]; then
-                    printf '%b' "${RED}Error: Command required.${NC}\n"
-                else
-                    OLD_IFS="$IFS"
-                    IFS='&'
-                    set -- $args
-                    IFS="$OLD_IFS"
-                    api_type="$1"
-                    if [ "$api_type" = "public" ] || [ "$api_type" = "secret" ]; then
-                        [ $# -gt 0 ] && shift
-                    else
-                        api_type="public"
-                    fi
-
-                    api_dir="db_manage/database/${CURRENT_DB}/api/$api_type"
-                    api_cfg="$api_dir/api.cfg"
-                    pid_file="$api_dir/api.pid"
-
-                    if [ ! -f "$api_cfg" ]; then
-                        printf '%b' "${RED}Error: API is not configured.${NC}\n"
-                    elif [ ! -f "$pid_file" ] || ! kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null; then
-                        printf '%b' "${RED}Error: API server is not running.${NC}\n"
-                    else
-                        api_proto_val=$(grep "^Protocol=" "$api_cfg" 2>/dev/null | cut -d'=' -f2)
-                        api_addr_val=$(grep "^Address=" "$api_cfg" 2>/dev/null | cut -d'=' -f2)
-                        api_port_val=$(grep "^Port=" "$api_cfg" 2>/dev/null | cut -d'=' -f2)
-                        api_secret_val=$(grep "^SecretKey=" "$api_cfg" 2>/dev/null | cut -d'=' -f2)
-                        
-                        proto="${api_proto_val:-http}"
-                        addr="${api_addr_val:-localhost}"
-                        port="${api_port_val:-8080}"
-                        
-                        sub_cmd="$1"
-                        if [ -z "$sub_cmd" ]; then
-                            printf '%b' "${RED}Error: Command required.${NC}\n"
-                            echo ""
-                            continue
-                        fi
-                        shift
-                        sub_args="$*"
-                        
-                        endpoint="/$sub_cmd"
-                        [ -n "$sub_args" ] && endpoint="/$sub_cmd/$sub_args"
-                        url="$proto://$addr:$port$endpoint"
-                        
-                        if command -v curl >/dev/null 2>&1; then
-                            curl_opts="-s"
-                            [ "$proto" = "https" ] && curl_opts="-s -k"
-                            if [ "$api_type" = "secret" ]; then
-                                curl $curl_opts -H "X-Secret-Key: $api_secret_val" "$url"
-                            else
-                                curl $curl_opts "$url"
-                            fi
-                            echo ""
-                        else
-                            printf '%b' "${RED}Error: 'curl' is required.${NC}\n"
-                        fi
+                        printf '%b' "${RED}API ($api_type) is not running.${NC}\n"
                     fi
                 fi
                 echo ""
@@ -2203,18 +2426,18 @@ EOF
                 IFS='&'
                 set -- $args
                 IFS="$OLD_IFS"
-                key_val="$1"
-                if [ -z "$key_val" ]; then
-                    printf '%b' "${RED}Error: Key required.${NC}\n"
+                new_key="$1"
+                new_key=$(echo "$new_key" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                if [ -z "$new_key" ]; then
+                    printf '%b' "${RED}Error: Secret key required. Usage: api_key_add <key>${NC}\n"
                 else
-                    count=0
-                    if [ -f "db_manage/secrets/database.cfg" ]; then
-                        raw_count=$(grep -c "^secret_key[0-9]" "db_manage/secrets/database.cfg" 2>/dev/null)
-                        [ -n "$raw_count" ] && count="$raw_count"
-                    fi
-                    next_idx=$(expr "$count" + 1)
-                    echo "secret_key$next_idx=$key_val" >> "db_manage/secrets/database.cfg"
-                    printf '%b' "${GREEN}Secret key added successfully as secret_key$next_idx.${NC}\n"
+                    cfg_file="db_manage/secrets/database.cfg"
+                    key_count=1
+                    while grep -q "^secret_key_${key_count}=" "$cfg_file" 2>/dev/null; do
+                        key_count=$(expr "$key_count" + 1)
+                    done
+                    echo "secret_key_${key_count}=$new_key" >> "$cfg_file"
+                    printf '%b' "${GREEN}Secret key added successfully as secret_key_${key_count}.${NC}\n"
                 fi
                 echo ""
                 ;;
@@ -2223,45 +2446,66 @@ EOF
                 IFS='&'
                 set -- $args
                 IFS="$OLD_IFS"
-                key_val="$1"
-                if [ -z "$key_val" ]; then
-                    printf '%b' "${RED}Error: Key required.${NC}\n"
+                rem_key="$1"
+                rem_key=$(echo "$rem_key" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                if [ -z "$rem_key" ]; then
+                    printf '%b' "${RED}Error: Secret key required. Usage: api_key_remove <key>${NC}\n"
                 else
-                    if [ -f "db_manage/secrets/database.cfg" ]; then
-                        temp_file="db_manage/secrets/database.cfg.tmp"
-                        touch "$temp_file"
-                        found=0
-                        i=1
-                        while IFS= read -r line || [ -n "$line" ]; do
-                            case "$line" in
-                                secret_key[0-9]*=*)
-                                    val=$(echo "$line" | cut -d'=' -f2)
-                                    if [ "$val" = "$key_val" ] || [ "$line" = "$key_val" ]; then
-                                        found=1
-                                    else
-                                        echo "secret_key$i=$val" >> "$temp_file"
-                                        i=$(expr "$i" + 1)
-                                    fi
-                                    ;;
-                                *)
-                                    [ -n "$line" ] && echo "$line" >> "$temp_file"
-                                    ;;
-                            esac
-                        done < "db_manage/secrets/database.cfg"
-                        mv "$temp_file" "db_manage/secrets/database.cfg"
-                        if [ "$found" -eq 1 ]; then
-                            printf '%b' "${GREEN}Secret key removed successfully.${NC}\n"
+                    cfg_file="db_manage/secrets/database.cfg"
+                    temp_f="$cfg_file.tmp"
+                    found_k=0
+                    while IFS='=' read -r k v || [ -n "$k" ]; do
+                        if [ "$k" = "$rem_key" ] || [ "$v" = "$rem_key" ]; then
+                            found_k=1
                         else
-                            printf '%b' "${RED}Error: Key not found.${NC}\n"
+                            [ -n "$k" ] && echo "$k=$v" >> "$temp_f"
                         fi
+                    done < "$cfg_file"
+                    [ -f "$temp_f" ] && mv "$temp_f" "$cfg_file"
+                    if [ "$found_k" -eq 1 ]; then
+                        printf '%b' "${GREEN}Secret key '$rem_key' removed successfully.${NC}\n"
                     else
-                        printf '%b' "${RED}Error: Configuration file does not exist.${NC}\n"
+                        printf '%b' "${RED}Error: Secret key '$rem_key' not found.${NC}\n"
+                    fi
+                fi
+                echo ""
+                ;;
+            "api_request")
+                if [ "$CURRENT_DB" = "none" ]; then
+                    printf '%b' "${RED}Error: No active database. Use 'use <name>' first.${NC}\n"
+                else
+                    OLD_IFS="$IFS"
+                    IFS='&'
+                    set -- $args
+                    IFS="$OLD_IFS"
+                    api_type="$1"
+                    shift
+                    req_cmd="$*"
+                    api_type=$(echo "$api_type" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                    req_cmd=$(echo "$req_cmd" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                    if [ -z "$api_type" ] || [ -z "$req_cmd" ]; then
+                        printf '%b' "${RED}Error: Usage: api_request <public|secret> <cmd>${NC}\n"
+                    else
+                        api_dir="db_manage/database/${CURRENT_DB}/api/$api_type"
+                        api_cfg="$api_dir/api.cfg"
+                        if [ ! -f "$api_cfg" ]; then
+                            printf '%b' "${RED}Error: API ($api_type) is not configured.${NC}\n"
+                        else
+                            port=$(grep "^Port=" "$api_cfg" 2>/dev/null | cut -d'=' -f2)
+                            proto=$(grep "^Protocol=" "$api_cfg" 2>/dev/null | cut -d'=' -f2)
+                            sec_key=$(grep "^SecretKey=" "$api_cfg" 2>/dev/null | cut -d'=' -f2)
+                            [ -z "$port" ] && port="8080"
+                            [ -z "$proto" ] && proto="http"
+                            endpoint=$(echo "$req_cmd" | tr ' ' '/')
+                            curl -s -k -H "X-Secret-Key: $sec_key" "${proto}://localhost:${port}/${endpoint}"
+                            echo ""
+                        fi
                     fi
                 fi
                 echo ""
                 ;;
             *)
-                printf '%b' "${RED}Unknown command: '$command'. Type 'help' for assistance.${NC}\n"
+                printf '%b' "${RED}Unknown command: '$command'. Type 'help' for available commands.${NC}\n"
                 echo ""
                 ;;
         esac
