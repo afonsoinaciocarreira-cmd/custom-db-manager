@@ -141,7 +141,7 @@ class DBAPIHandler(http.server.BaseHTTPRequestHandler):
             if path in ["/", "/status"]:
                 tables = [d for d in os.listdir(TABLES_DIR) if os.path.isdir(os.path.join(TABLES_DIR, d))] if os.path.exists(TABLES_DIR) else []
                 response_data.update({
-                    "message": "Real database API server is running.",
+                    "message": "Database API running successfully!",
                     "tables": tables
                 })
                 accept_header = self.headers.get("Accept", "")
@@ -407,20 +407,20 @@ class DBAPIHandler(http.server.BaseHTTPRequestHandler):
         ul {{ list-style-type: none; padding: 0; }}
         li {{ background: #334155; margin: 8px 0; padding: 12px 16px; border-radius: 6px; display: flex; align-items: center; font-weight: 500; }}
         .status-box {{ background: #064e3b; border: 1px solid #059669; color: #34d399; padding: 12px 16px; border-radius: 6px; margin-bottom: 20px; font-weight: 600; }}
-        .footer {{ margin-top: 20px; text-align: center; color: #38bdf8; font-weight: bold; }}
+        .footer {{ margin-top: 20px; text-align: cesnter; color: #38bdf8; font-weight: bold; }}
     </style>
 </head>
 <body>
     <div class="container">
         <h1>Database Server Dashboard <span>{DB_NAME}</span></h1>
-        <div class="status-box">✓ Real API Server Active & Responding Live</div>
+        <div class="status-box">✓ Database API running successfully!</div>
         {api_type_html}
         <p><strong>Protocol:</strong> <code>{PROTOCOL.upper()}</code></p>
         <h3>Active Database Tables:</h3>
         <ul>
             {"".join([f"<li>📁 &nbsp; {t}</li>" for t in data.get('tables', [])]) if data.get('tables') else "<li>(No tables found)</li>"}
         </ul>
-        <h3>Real Server Response Output (JSON):</h3>
+        <h3>Output (JSON):</h3>
         <pre>{json.dumps(data, indent=2)}</pre>
         {footer_html}
     </div>
@@ -808,8 +808,9 @@ while true; do
                 init_backup_configs_file "db_manage/secrets/backup_configs.cfg"
                 init_backup_schedule_file "db_manage/secrets/backup_schedule.cfg"
                 
-                printf '%b' "${GREEN}System terminated successfully. All processes were terminated and db_manage directory was cleaned/recreated.${NC}\n"
+                printf '%b' "${GREEN}System terminated successfully. All processes were terminated and db_manage directory was restored.${NC}\n"
                 echo ""
+                show_banner
                 ;;
             "system_process")
                 OLD_IFS="$IFS"
@@ -2140,10 +2141,12 @@ print(f"\033[0;32mTable '\''{tbl_name}'\'', column '\''{cols_str}'\'': inserted 
                     printf '%b' "Enter Protocol (http or https) [http]: "
                     read -r api_protocol
                     [ -z "$api_protocol" ] && api_protocol="http"
-                    printf '%b' "Enter API Address: "
+                    printf '%b' "Enter API Address (localhost): "
                     read -r api_address
-                    printf '%b' "Enter API Port: "
+                    [ -z "$api_address" ] && api_address="http"
+                    printf '%b' "Enter API Port (8080): "
                     read -r api_port
+                    [ -z "$api_port" ] && api_port="8080"
                     printf '%b' "Enter API Debug (true or false) [true]: "
                     read -r api_debug
                     [ -z "$api_debug" ] && api_debug="true"
