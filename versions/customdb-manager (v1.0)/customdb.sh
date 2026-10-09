@@ -25,6 +25,40 @@ show_banner() {
     printf '%b' " Type '${YELLOW}help${NC}' for commands or '${RED}exit${NC}' to quit.\n\n"
 }
 
+check_ip_port_in_use() {
+    chk_db="$1"
+    chk_type="$2"
+    chk_addr="$3"
+    chk_port="$4"
+    
+    [ -z "$chk_addr" ] && chk_addr="localhost"
+    [ -z "$chk_port" ] && chk_port="8080"
+    
+    if [ -d "db_manage/database" ]; then
+        for db_d in db_manage/database/*; do
+            [ -d "$db_d" ] || continue
+            other_db=$(basename "$db_d")
+            for api_t in public secret; do
+                if [ "$other_db" = "$chk_db" ] && [ "$api_t" = "$chk_type" ]; then
+                    continue
+                fi
+                cfg_f="$db_d/api/$api_t/api.cfg"
+                if [ -f "$cfg_f" ]; then
+                    e_addr=$(grep "^Address=" "$cfg_f" 2>/dev/null | cut -d'=' -f2 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                    e_port=$(grep "^Port=" "$cfg_f" 2>/dev/null | cut -d'=' -f2 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                    [ -z "$e_addr" ] && e_addr="localhost"
+                    [ -z "$e_port" ] && e_port="8080"
+                    
+                    if [ "$e_port" = "$chk_port" ]; then
+                        return 1
+                    fi
+                fi
+            done
+        done
+    fi
+    return 0
+}
+
 generate_server_script() {
     server_script="$1"
     cat << 'EOF' > "$server_script"
@@ -106,7 +140,7 @@ class DBAPIHandler(http.server.BaseHTTPRequestHandler):
                 return
             REQUEST_TIMESTAMPS[client_ip].append(current_time)
 
-        if API_TYPE == "secret" and not self._check_auth():
+        if not self._check_auth():
             err_data = {"status": "error", "error": "Unauthorized"}
             self._send_response(401, err_data)
             return
@@ -682,7 +716,8 @@ show_banner
 while true; do
     printf '%b' "${CYAN}$HOST${NC}@${BLUE}$CURRENT_DB${NC} -> "
     read -r line
-    [ -z "$line" ] && continue
+    line_trim=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    [ -z "$line_trim" ] && continue
 
     OLD_IFS="$IFS"
     IFS='|'
@@ -813,10 +848,8 @@ while true; do
                 show_banner
                 ;;
             "system_process")
-                OLD_IFS="$IFS"
-                IFS='&'
-                set -- $args
-                IFS="$OLD_IFS"
+                args_clean=$(echo "$args" | tr '&' ' ')
+                set -- $args_clean
                 sp_action="$1"
                 sp_target="$2"
                 sp_action=$(echo "$sp_action" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
@@ -838,8 +871,9 @@ while true; do
                             else
                                 pid_disp="${RED}Stopped${NC}"
                                 rm -f "$pid_f"
+                                continue
                             fi
-                            printf '%b' "  - ${CYAN}Backup Process:${NC} ${YELLOW}${proc_name}${NC} -> Status: ${status_val}, Process: ${pid_disp}\n"
+                            printf '%b' "  - ${CYAN}Backup Process:${NC} Process Name: ${YELLOW}${proc_name}${NC}, Database: ${YELLOW}System${NC} -> Status: ${status_val}, Process: ${pid_disp}\n"
                         done
                     fi
                     if [ -d "db_manage/database" ]; then
@@ -858,8 +892,9 @@ while true; do
                                 else
                                     pid_disp="${RED}Stopped${NC}"
                                     rm -f "$pid_f"
+                                    continue
                                 fi
-                                printf '%b' "  - ${CYAN}API Server (${api_t}):${NC} Database: ${YELLOW}${dbname}${NC} -> Status: ${status_val}, Process: ${pid_disp}\n"
+                                printf '%b' "  - ${CYAN}API Server (${api_t}):${NC} Process Name: ${YELLOW}${dbname}-${api_t}${NC}, Database: ${YELLOW}${dbname}${NC} -> Status: ${status_val}, Process: ${pid_disp}\n"
                             done
                         done
                     fi
@@ -877,25 +912,42 @@ while true; do
                         fi
                         if [ -f "db_manage/secrets/backup_${sp_target}.pid" ]; then
                             p=$(cat "db_manage/secrets/backup_${sp_target}.pid" 2>/dev/null)
-                            [ -n "$p" ] && kill "$p" 2>/dev/null
+                            if [ -n "$p" ]; then
+                                kill "$p" 2>/dev/null || kill -9 "$p" 2>/dev/null
+                            fi
                             rm -f "db_manage/secrets/backup_${sp_target}.pid"
                             killed=1
                         fi
-                        for db_d in db_manage/database/*; do
-                            [ -d "$db_d" ] || continue
-                            dbname=$(basename "$db_d")
-                            for api_t in public secret; do
-                                pid_f="$db_d/api/$api_t/api.pid"
-                                if [ -f "$pid_f" ]; then
-                                    p=$(cat "$pid_f" 2>/dev/null)
-                                    if [ "$dbname" = "$sp_target" ] || [ "${dbname}-${api_t}" = "$sp_target" ] || [ "$p" = "$sp_target" ]; then
-                                        [ -n "$p" ] && kill "$p" 2>/dev/null
-                                        rm -f "$pid_f"
-                                        killed=1
-                                    fi
+                        if [ -d "db_manage/secrets" ]; then
+                            for pid_f in db_manage/secrets/backup_*.pid; do
+                                [ -f "$pid_f" ] || continue
+                                p=$(cat "$pid_f" 2>/dev/null)
+                                if [ "$p" = "$sp_target" ]; then
+                                    kill "$p" 2>/dev/null || kill -9 "$p" 2>/dev/null
+                                    rm -f "$pid_f"
+                                    killed=1
                                 fi
                             done
-                        done
+                        fi
+                        if [ -d "db_manage/database" ]; then
+                            for db_d in db_manage/database/*; do
+                                [ -d "$db_d" ] || continue
+                                dbname=$(basename "$db_d")
+                                for api_t in public secret; do
+                                    pid_f="$db_d/api/$api_t/api.pid"
+                                    if [ -f "$pid_f" ]; then
+                                        p=$(cat "$pid_f" 2>/dev/null)
+                                        if [ "$dbname" = "$sp_target" ] || [ "${dbname}-${api_t}" = "$sp_target" ] || [ "$api_t" = "$sp_target" ] || [ "$p" = "$sp_target" ]; then
+                                            if [ -n "$p" ]; then
+                                                kill "$p" 2>/dev/null || kill -9 "$p" 2>/dev/null
+                                            fi
+                                            rm -f "$pid_f"
+                                            killed=1
+                                        fi
+                                    fi
+                                done
+                            done
+                        fi
                         if [ "$killed" -eq 1 ]; then
                             printf '%b' "${GREEN}Process '$sp_target' terminated successfully.${NC}\n"
                         else
@@ -1427,7 +1479,7 @@ else:
                             for col_name in "$@"; do
                                 col_name=$(echo "$col_name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
                                 [ -z "$col_name" ] && continue
-                                python3 -c '
+                                res=$(python3 -c '
 import sys, os
 tbl_dir = sys.argv[1]
 col_name = sys.argv[2]
@@ -1438,6 +1490,7 @@ if not os.path.exists(cols_file):
 with open(cols_file, "r") as f:
     cols = [c.replace("\r", "").strip() for c in f if c.strip()]
 if col_name in cols:
+    print("EXISTS")
     sys.exit(0)
 cols.append(col_name)
 with open(cols_file, "w") as f:
@@ -1456,8 +1509,13 @@ if os.path.exists(data_file):
     with open(data_file, "w") as f:
         for l in new_lines:
             f.write(l + "\n")
-' "$tbl_dir" "$col_name"
-                                printf '%b' "${GREEN}Column '$col_name' added to table '$tbl_name'.${NC}\n"
+print("ADDED")
+' "$tbl_dir" "$col_name")
+                                if [ "$res" = "EXISTS" ]; then
+                                    printf '%b' "${RED}Error: Column '$col_name' already exists in table '$tbl_name'.${NC}\n"
+                                else
+                                    printf '%b' "${GREEN}Column '$col_name' added to table '$tbl_name'.${NC}\n"
+                                fi
                             done
                         fi
                     fi
@@ -2055,10 +2113,8 @@ print(f"\033[0;32mTable '\''{tbl_name}'\'', column '\''{cols_str}'\'': inserted 
                     perm_file="db_manage/database/${CURRENT_DB}/api/public/permissions.cfg"
                     init_permissions_file "$perm_file"
 
-                    OLD_IFS="$IFS"
-                    IFS='&'
-                    set -- $args
-                    IFS="$OLD_IFS"
+                    args_clean=$(echo "$args" | tr '&' ' ')
+                    set -- $args_clean
                     p_name="$1"
                     p_val="$2"
                     p_name=$(echo "$p_name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
@@ -2075,20 +2131,24 @@ print(f"\033[0;32mTable '\''{tbl_name}'\'', column '\''{cols_str}'\'': inserted 
                         printf '%b' "${RED}Error: Invalid value '$p_val'. Permission value must be explicitly set to 'true' or 'false'.${NC}\n"
                     else
                         temp_f="$perm_file.tmp"
+                        rm -f "$temp_f"
                         found_p=0
                         while IFS='=' read -r k v || [ -n "$k" ]; do
-                            if [ "$k" = "$p_name" ]; then
-                                echo "$k=$p_val" >> "$temp_f"
+                            k_clean=$(echo "$k" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/\r//g')
+                            v_clean=$(echo "$v" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/\r//g')
+                            if [ "$k_clean" = "$p_name" ]; then
+                                echo "$k_clean=$p_val" >> "$temp_f"
                                 found_p=1
                             else
-                                [ -n "$k" ] && echo "$k=$v" >> "$temp_f"
+                                [ -n "$k_clean" ] && echo "$k_clean=$v_clean" >> "$temp_f"
                             fi
                         done < "$perm_file"
-                        mv "$temp_f" "$perm_file"
 
                         if [ "$found_p" -eq 1 ]; then
+                            mv "$temp_f" "$perm_file"
                             printf '%b' "${GREEN}Permission '$p_name' updated successfully to '$p_val'.${NC}\n"
                         else
+                            rm -f "$temp_f"
                             printf '%b' "${RED}Error: Permission '$p_name' does not exist in the configuration file.${NC}\n"
                         fi
                     fi
@@ -2143,10 +2203,17 @@ print(f"\033[0;32mTable '\''{tbl_name}'\'', column '\''{cols_str}'\'': inserted 
                     [ -z "$api_protocol" ] && api_protocol="http"
                     printf '%b' "Enter API Address (localhost): "
                     read -r api_address
-                    [ -z "$api_address" ] && api_address="http"
+                    [ -z "$api_address" ] && api_address="localhost"
                     printf '%b' "Enter API Port (8080): "
                     read -r api_port
                     [ -z "$api_port" ] && api_port="8080"
+
+                    if ! check_ip_port_in_use "$CURRENT_DB" "$api_type" "$api_address" "$api_port"; then
+                        printf '%b' "${RED}Error: Address '$api_address' and Port '$api_port' are already in use by another API. Please try again inserting a valid port.${NC}\n"
+                        echo ""
+                        continue
+                    fi
+
                     printf '%b' "Enter API Debug (true or false) [true]: "
                     read -r api_debug
                     [ -z "$api_debug" ] && api_debug="true"
@@ -2210,8 +2277,8 @@ EOF
 
                     curr_name=""
                     curr_proto="http"
-                    curr_addr=""
-                    curr_port=""
+                    curr_addr="localhost"
+                    curr_port="8080"
                     curr_debug="true"
                     curr_secret="default_secret"
                     if [ -f "$api_cfg" ]; then
@@ -2243,6 +2310,12 @@ EOF
                     printf '%b' "Enter new Port [$curr_port]: "
                     read -r new_port
                     [ -n "$new_port" ] && curr_port="$new_port"
+
+                    if ! check_ip_port_in_use "$CURRENT_DB" "$api_type" "$curr_addr" "$curr_port"; then
+                        printf '%b' "${RED}Error: Address '$curr_addr' and Port '$curr_port' are already in use by another API. Please try again inserting a valid port.${NC}\n"
+                        echo ""
+                        continue
+                    fi
 
                     printf '%b' "Enter new API Debug [$curr_debug]: "
                     read -r new_debug
@@ -2287,15 +2360,13 @@ EOF
                 if [ "$CURRENT_DB" = "none" ]; then
                     printf '%b' "${RED}Error: No active database. Use 'use <name>' first.${NC}\n"
                 else
-                    OLD_IFS="$IFS"
-                    IFS='&'
-                    set -- $args
-                    IFS="$OLD_IFS"
+                    args_clean=$(echo "$args" | tr '&' ' ')
+                    set -- $args_clean
                     api_type="$1"
                     api_type=$(echo "$api_type" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
                     [ -z "$api_type" ] && api_type="public"
                     if [ "$api_type" != "public" ] && [ "$api_type" != "secret" ]; then
-                        printf '%b' "${RED}Error: Invalid API type.${NC}\n"
+                        printf '%b' "${RED}Error: Invalid API type. Use 'public' or 'secret'.${NC}\n"
                         echo ""
                         continue
                     fi
@@ -2306,22 +2377,36 @@ EOF
                     server_script="$api_dir/server.py"
 
                     if [ ! -f "$api_cfg" ]; then
-                        printf '%b' "${RED}Error: API is not configured.${NC}\n"
+                        printf '%b' "${RED}Error: API ($api_type) is not configured.${NC}\n"
                     elif [ -f "$pid_file" ] && kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null; then
-                        printf '%b' "${YELLOW}API is already running.${NC}\n"
+                        printf '%b' "${YELLOW}Error: API ($api_type) server is already running (PID: $(cat "$pid_file")).${NC}\n"
                     else
                         [ ! -f "$server_script" ] && generate_server_script "$server_script"
                         [ "$api_type" = "public" ] && init_permissions_file "$api_dir/permissions.cfg"
 
-                        api_name_val=$(grep "^Name=" "$api_cfg" 2>/dev/null | cut -d'=' -f2)
-                        api_proto_val=$(grep "^Protocol=" "$api_cfg" 2>/dev/null | cut -d'=' -f2)
-                        api_port_val=$(grep "^Port=" "$api_cfg" 2>/dev/null | cut -d'=' -f2)
-                        api_debug_val=$(grep "^ApiDebug=" "$api_cfg" 2>/dev/null | cut -d'=' -f2)
-                        api_secret_val=$(grep "^SecretKey=" "$api_cfg" 2>/dev/null | cut -d'=' -f2)
+                        api_name_val=$(grep "^Name=" "$api_cfg" 2>/dev/null | cut -d'=' -f2 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                        api_proto_val=$(grep "^Protocol=" "$api_cfg" 2>/dev/null | cut -d'=' -f2 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                        api_addr_val=$(grep "^Address=" "$api_cfg" 2>/dev/null | cut -d'=' -f2 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                        api_port_val=$(grep "^Port=" "$api_cfg" 2>/dev/null | cut -d'=' -f2 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                        api_debug_val=$(grep "^ApiDebug=" "$api_cfg" 2>/dev/null | cut -d'=' -f2 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                        api_secret_val=$(grep "^SecretKey=" "$api_cfg" 2>/dev/null | cut -d'=' -f2 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
                         
                         proto="${api_proto_val:-http}"
+                        addr="${api_addr_val:-localhost}"
                         port="${api_port_val:-8080}"
                         debug="${api_debug_val:-true}"
+
+                        if python3 -c "import socket; s = socket.socket(); s.settimeout(0.5); exit(0 if s.connect_ex(('$addr', $port)) == 0 else 1)" 2>/dev/null; then
+                            printf '%b' "${RED}Error: Address '$addr' and Port '$port' are already in use on the system.${NC}\n"
+                            echo ""
+                            continue
+                        fi
+
+                        if ! check_ip_port_in_use "$CURRENT_DB" "$api_type" "$addr" "$port"; then
+                            printf '%b' "${RED}Error: Address '$addr' and Port '$port' are already in use by another API. Please try again inserting a valid port.${NC}\n"
+                            echo ""
+                            continue
+                        fi
 
                         cert_arg=""
                         key_arg=""
@@ -2336,9 +2421,14 @@ EOF
 
                         API_PORT="$port" API_SECRET="${api_secret_val:-default_secret}" DB_NAME="$CURRENT_DB" API_PROTOCOL="$proto" API_TYPE="$api_type" API_DEBUG="$debug" API_CERT="$cert_arg" API_KEY="$key_arg" python3 "$server_script" > "$api_dir/server.log" 2>&1 &
                         server_pid=$!
-                        echo "$server_pid" > "$pid_file"
-
-                        printf '%b' "${GREEN}API server started successfully on port ${port} (PID: ${server_pid})!${NC}\n"
+                        sleep 0.5
+                        if kill -0 "$server_pid" 2>/dev/null; then
+                            echo "$server_pid" > "$pid_file"
+                            printf '%b' "${GREEN}API ($api_type) server started successfully on port ${port} (PID: ${server_pid})!${NC}\n"
+                        else
+                            rm -f "$pid_file"
+                            printf '%b' "${RED}Error: Failed to start API ($api_type) server. Check log at '$api_dir/server.log'.${NC}\n"
+                        fi
                     fi
                 fi
                 echo ""
@@ -2347,28 +2437,29 @@ EOF
                 if [ "$CURRENT_DB" = "none" ]; then
                     printf '%b' "${RED}Error: No active database. Use 'use <name>' first.${NC}\n"
                 else
-                    OLD_IFS="$IFS"
-                    IFS='&'
-                    set -- $args
-                    IFS="$OLD_IFS"
+                    args_clean=$(echo "$args" | tr '&' ' ')
+                    set -- $args_clean
                     api_type="$1"
                     api_type=$(echo "$api_type" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                    [ -n "$api_type" ] && shift
                     [ -z "$api_type" ] && api_type="public"
                     
-                    api_dir="db_manage/database/${CURRENT_DB}/api/$api_type"
-                    pid_file="$api_dir/api.pid"
-
-                    if [ ! -f "$pid_file" ]; then
-                        printf '%b' "${YELLOW}API is not currently running.${NC}\n"
+                    if [ "$api_type" != "public" ] && [ "$api_type" != "secret" ]; then
+                        printf '%b' "${RED}Error: Invalid API type. Use 'public' or 'secret'.${NC}\n"
                     else
-                        pid=$(cat "$pid_file" 2>/dev/null)
-                        if [ -n "$pid" ] && kill "$pid" 2>/dev/null; then
-                            printf '%b' "${GREEN}API server stopped successfully.${NC}\n"
+                        api_dir="db_manage/database/${CURRENT_DB}/api/$api_type"
+                        pid_file="$api_dir/api.pid"
+
+                        if [ ! -f "$pid_file" ]; then
+                            printf '%b' "${YELLOW}API ($api_type) is not currently running.${NC}\n"
                         else
-                            printf '%b' "${RED}Error: Failed to stop API server or process not running.${NC}\n"
+                            pid=$(cat "$pid_file" 2>/dev/null)
+                            if [ -n "$pid" ] && kill "$pid" 2>/dev/null; then
+                                printf '%b' "${GREEN}API ($api_type) server stopped successfully.${NC}\n"
+                            else
+                                printf '%b' "${RED}Error: Failed to stop API ($api_type) server or process not running.${NC}\n"
+                            fi
+                            rm -f "$pid_file"
                         fi
-                        rm -f "$pid_file"
                     fi
                 fi
                 echo ""
@@ -2377,28 +2468,30 @@ EOF
                 if [ "$CURRENT_DB" = "none" ]; then
                     printf '%b' "${RED}Error: No active database. Use 'use <name>' first.${NC}\n"
                 else
-                    OLD_IFS="$IFS"
-                    IFS='&'
-                    set -- $args
-                    IFS="$OLD_IFS"
+                    args_clean=$(echo "$args" | tr '&' ' ')
+                    set -- $args_clean
                     api_type="$1"
                     api_type=$(echo "$api_type" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
                     [ -z "$api_type" ] && api_type="public"
                     if [ "$api_type" != "public" ] && [ "$api_type" != "secret" ]; then
-                        printf '%b' "${RED}Error: Invalid API type.${NC}\n"
+                        printf '%b' "${RED}Error: Invalid API type. Use 'public' or 'secret'.${NC}\n"
                         echo ""
                         continue
                     fi
 
                     api_dir="db_manage/database/${CURRENT_DB}/api/$api_type"
-                    pid_file="$api_dir/api.pid"
-                    if [ -f "$pid_file" ]; then
-                        pid=$(cat "$pid_file" 2>/dev/null)
-                        [ -n "$pid" ] && kill "$pid" 2>/dev/null
-                        rm -f "$pid_file"
+                    if [ ! -d "$api_dir" ] || [ ! -f "$api_dir/api.cfg" ]; then
+                        printf '%b' "${RED}Error: API ($api_type) does not exist.${NC}\n"
+                    else
+                        pid_file="$api_dir/api.pid"
+                        if [ -f "$pid_file" ]; then
+                            pid=$(cat "$pid_file" 2>/dev/null)
+                            [ -n "$pid" ] && kill "$pid" 2>/dev/null
+                            rm -f "$pid_file"
+                        fi
+                        rm -rf "$api_dir"
+                        printf '%b' "${GREEN}API ($api_type) deleted successfully.${NC}\n"
                     fi
-                    rm -rf "$api_dir"
-                    printf '%b' "${GREEN}API ($api_type) deleted successfully.${NC}\n"
                 fi
                 echo ""
                 ;;
@@ -2406,41 +2499,91 @@ EOF
                 if [ "$CURRENT_DB" = "none" ]; then
                     printf '%b' "${RED}Error: No active database. Use 'use <name>' first.${NC}\n"
                 else
-                    OLD_IFS="$IFS"
-                    IFS='&'
-                    set -- $args
-                    IFS="$OLD_IFS"
+                    args_clean=$(echo "$args" | tr '&' ' ')
+                    set -- $args_clean
                     api_type="$1"
                     api_type=$(echo "$api_type" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
                     [ -z "$api_type" ] && api_type="public"
-                    
-                    api_dir="db_manage/database/${CURRENT_DB}/api/$api_type"
-                    pid_file="$api_dir/api.pid"
-                    if [ -f "$pid_file" ] && kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null; then
-                        printf '%b' "${GREEN}API ($api_type) is running (PID: $(cat "$pid_file")).${NC}\n"
+
+                    if [ "$api_type" != "public" ] && [ "$api_type" != "secret" ]; then
+                        printf '%b' "${RED}Error: Invalid API type. Use 'public' or 'secret'.${NC}\n"
                     else
-                        printf '%b' "${RED}API ($api_type) is not running.${NC}\n"
+                        api_dir="db_manage/database/${CURRENT_DB}/api/$api_type"
+                        api_cfg="$api_dir/api.cfg"
+                        pid_file="$api_dir/api.pid"
+
+                        if [ ! -f "$pid_file" ] || ! kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null; then
+                            printf '%b' "${RED}Error: API ($api_type) server is not running.${NC}\n"
+                        else
+                            running_pid=$(cat "$pid_file" 2>/dev/null)
+                            api_name=""
+                            api_proto=""
+                            api_addr=""
+                            api_port=""
+                            api_debug=""
+
+                            if [ -f "$api_cfg" ]; then
+                                while IFS='=' read -r key val || [ -n "$key" ]; do
+                                    key_clean=$(echo "$key" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/\r//g')
+                                    val_clean=$(echo "$val" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/\r//g')
+                                    case "$key_clean" in
+                                        Name) api_name="$val_clean" ;;
+                                        Protocol) api_proto="$val_clean" ;;
+                                        Address) api_addr="$val_clean" ;;
+                                        Port) api_port="$val_clean" ;;
+                                        ApiDebug) api_debug="$val_clean" ;;
+                                    esac
+                                done < "$api_cfg"
+                            fi
+
+                            api_type_upper=$(echo "$api_type" | tr '[:lower:]' '[:upper:]')
+                            printf '%b' "${CYAN}${BOLD}==================================================${NC}\n"
+                            printf '%b' "${CYAN}${BOLD}       API SERVER STATUS (${api_type_upper})       ${NC}\n"
+                            printf '%b' "${CYAN}${BOLD}==================================================${NC}\n"
+                            printf '%b' "  ${BOLD}Name:${NC}          ${YELLOW}${api_name}${NC}\n"
+                            printf '%b' "  ${BOLD}Type:${NC}          ${YELLOW}${api_type_upper}${NC}\n"
+                            printf '%b' "  ${BOLD}Status:${NC}        ${GREEN}Running${NC}\n"
+                            printf '%b' "  ${BOLD}PID:${NC}           ${GREEN}${running_pid}${NC}\n"
+                            printf '%b' "  ${BOLD}Protocol:${NC}      ${YELLOW}${api_proto}${NC}\n"
+                            printf '%b' "  ${BOLD}Address:${NC}       ${YELLOW}${api_addr}${NC}\n"
+                            printf '%b' "  ${BOLD}Port:${NC}          ${YELLOW}${api_port}${NC}\n"
+                            printf '%b' "  ${BOLD}Debug:${NC}         ${YELLOW}${api_debug}${NC}\n"
+                            printf '%b' "${CYAN}==================================================${NC}\n"
+                        fi
                     fi
                 fi
                 echo ""
                 ;;
             "api_key_add")
-                OLD_IFS="$IFS"
-                IFS='&'
-                set -- $args
-                IFS="$OLD_IFS"
+                args_clean=$(echo "$args" | tr '&' ' ')
+                set -- $args_clean
                 new_key="$1"
                 new_key=$(echo "$new_key" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
                 if [ -z "$new_key" ]; then
                     printf '%b' "${RED}Error: Secret key required. Usage: api_key_add <key>${NC}\n"
                 else
                     cfg_file="db_manage/secrets/database.cfg"
-                    key_count=1
-                    while grep -q "^secret_key_${key_count}=" "$cfg_file" 2>/dev/null; do
-                        key_count=$(expr "$key_count" + 1)
-                    done
-                    echo "secret_key_${key_count}=$new_key" >> "$cfg_file"
-                    printf '%b' "${GREEN}Secret key added successfully as secret_key_${key_count}.${NC}\n"
+                    [ -f "$cfg_file" ] || touch "$cfg_file"
+                    already_exists=0
+                    while IFS='=' read -r k v || [ -n "$k" ]; do
+                        k_clean=$(echo "$k" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/\r//g')
+                        v_clean=$(echo "$v" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/\r//g')
+                        if [ "$k_clean" = "$new_key" ] || [ "$v_clean" = "$new_key" ]; then
+                            already_exists=1
+                            break
+                        fi
+                    done < "$cfg_file"
+
+                    if [ "$already_exists" -eq 1 ]; then
+                        printf '%b' "${RED}Error: Secret key '$new_key' already exists.${NC}\n"
+                    else
+                        key_count=1
+                        while grep -q "^secret_key_${key_count}=" "$cfg_file" 2>/dev/null; do
+                            key_count=$(expr "$key_count" + 1)
+                        done
+                        echo "secret_key_${key_count}=$new_key" >> "$cfg_file"
+                        printf '%b' "${GREEN}Secret key added successfully as secret_key_${key_count}.${NC}\n"
+                    fi
                 fi
                 echo ""
                 ;;
@@ -2477,10 +2620,8 @@ EOF
                 if [ "$CURRENT_DB" = "none" ]; then
                     printf '%b' "${RED}Error: No active database. Use 'use <name>' first.${NC}\n"
                 else
-                    OLD_IFS="$IFS"
-                    IFS='&'
-                    set -- $args
-                    IFS="$OLD_IFS"
+                    args_clean=$(echo "$args" | tr '&' ' ')
+                    set -- $args_clean
                     api_type="$1"
                     shift
                     req_cmd="$*"
@@ -2488,15 +2629,20 @@ EOF
                     req_cmd=$(echo "$req_cmd" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
                     if [ -z "$api_type" ] || [ -z "$req_cmd" ]; then
                         printf '%b' "${RED}Error: Usage: api_request <public|secret> <cmd>${NC}\n"
+                    elif [ "$api_type" != "public" ] && [ "$api_type" != "secret" ]; then
+                        printf '%b' "${RED}Error: Invalid API type. Use 'public' or 'secret'.${NC}\n"
                     else
                         api_dir="db_manage/database/${CURRENT_DB}/api/$api_type"
                         api_cfg="$api_dir/api.cfg"
+                        pid_file="$api_dir/api.pid"
                         if [ ! -f "$api_cfg" ]; then
                             printf '%b' "${RED}Error: API ($api_type) is not configured.${NC}\n"
+                        elif [ ! -f "$pid_file" ] || ! kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null; then
+                            printf '%b' "${RED}Error: API ($api_type) server is not running.${NC}\n"
                         else
-                            port=$(grep "^Port=" "$api_cfg" 2>/dev/null | cut -d'=' -f2)
-                            proto=$(grep "^Protocol=" "$api_cfg" 2>/dev/null | cut -d'=' -f2)
-                            sec_key=$(grep "^SecretKey=" "$api_cfg" 2>/dev/null | cut -d'=' -f2)
+                            port=$(grep "^Port=" "$api_cfg" 2>/dev/null | cut -d'=' -f2 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                            proto=$(grep "^Protocol=" "$api_cfg" 2>/dev/null | cut -d'=' -f2 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                            sec_key=$(grep "^SecretKey=" "$api_cfg" 2>/dev/null | cut -d'=' -f2 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
                             [ -z "$port" ] && port="8080"
                             [ -z "$proto" ] && proto="http"
                             endpoint=$(echo "$req_cmd" | tr ' ' '/')
