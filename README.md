@@ -160,7 +160,7 @@ cd "$HOME/custom-db-manager"
 
 ```bash
 curl -fL \
-  'https://raw.githubusercontent.com/afonsoinaciocarreira-cmd/custom-db-manager/refs/heads/main/versions/customdb-manager%20%28v1.0%29/customdb.sh' \
+  'https://raw.githubusercontent.com/afonsoinaciocarreira-cmd/custom-db-manager/refs/heads/main/customdb.sh' \
   -o customdb.sh
 ```
 
