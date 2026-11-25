@@ -661,6 +661,6 @@ See **[SECURITY.md](SECURITY.md)** for the security model, deployment recommenda
 - **Format:** a single Bash file with an embedded Python layer
 - **Published file:** `versions/customdb-manager (v1.0)/customdb.sh`
 - **Repository:** <https://github.com/afonsoinaciocarreira-cmd/custom-db-manager>
-- **Direct source:** <https://raw.githubusercontent.com/afonsoinaciocarreira-cmd/custom-db-manager/refs/heads/main/versions/customdb-manager%20%28v1.0%29/customdb.sh>
+- **Direct source:** <https://raw.githubusercontent.com/afonsoinaciocarreira-cmd/custom-db-manager/refs/heads/main/customdb.sh>
 
 The licence and redistribution terms must be checked in the official repository. This document does not grant any usage or redistribution rights beyond those granted by the applicable licence.
