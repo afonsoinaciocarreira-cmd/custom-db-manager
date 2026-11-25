@@ -64,7 +64,7 @@ show_help() {
     printf '%b' "   ${CYAN}api_start <public|secret>${NC}         ${GRAY}- Start API server${NC}\n"
     printf '%b' "   ${CYAN}api_stop <public|secret> [--force]${NC} ${GRAY}- Stop API server${NC}\n"
     printf '%b' "   ${CYAN}api_delete <public|secret>${NC}        ${GRAY}- Delete API files${NC}\n"
-    printf '%b' "   ${CYAN}api_request <public|secret> <cmd>${NC} ${GRAY}- Run CLI command via API${NC}\n"
+    printf '%b' "   ${CYAN}api_request <public|secret> <cmd>${NC} ${GRAY}- Run CLI command via API (query key or Authorization header)${NC}\n"
     printf '%b' "   ${CYAN}api_setup <public|secret>${NC}         ${GRAY}- Setup API configuration${NC}\n"
     printf '%b' "   ${CYAN}api_edit <public|secret>${NC}          ${GRAY}- Edit API configuration${NC}\n"
     printf '%b' "   ${CYAN}api_permissions <perm> <true|false>${NC} ${GRAY}- Manage public API permissions${NC}\n"
@@ -87,8 +87,10 @@ show_help() {
     printf '%b' "   ${CYAN}show_columns <table>${NC}              ${GRAY}- List columns${NC}\n"
     printf '%b' "   ${CYAN}rename_column <table> <old> <new>${NC} ${GRAY}- Rename a column${NC}\n\n"
     printf '%b' " ${YELLOW}[ ⚡ DATA OPERATIONS ]${NC}\n"
-    printf '%b' "   ${CYAN}insert_into <table> <column> <value>${NC} ${GRAY}- Insert data${NC}\n"
+    printf '%b' "   ${CYAN}insert_into <table> <column> "<value with spaces>"${NC} ${GRAY}- Append data (never overwrites existing rows)${NC}\n"
     printf '%b' "   ${CYAN}select_from <table>${NC}               ${GRAY}- Query data from a table${NC}\n"
+    printf '%b' "   ${CYAN}search <table> <column> "<value>"${NC} ${GRAY}- Search records using the optional index${NC}\n"
+    printf '%b' "   ${CYAN}index <table> <on|off|rebuild|status>${NC} ${GRAY}- Manage the table index${NC}\n"
     printf '%b' "   ${CYAN}update <table> <column> <old> <new>${NC} ${GRAY}- Update records${NC}\n"
     printf '%b' "   ${CYAN}delete_from <table>${NC}               ${GRAY}- Delete all records${NC}\n"
     printf '%b' "   ${CYAN}delete_record <table> <column> <val>${NC} ${GRAY}- Delete a record${NC}\n\n"
@@ -247,6 +249,7 @@ All other commands continue to be handled by the original Bash CLI.
 from __future__ import annotations
 import contextlib
 import datetime as dt
+import fcntl
 import getpass
 import hashlib
 import html
@@ -291,6 +294,77 @@ GREEN = "\033[0;32m"
 YELLOW = "\033[1;33m"
 CYAN = "\033[0;36m"
 BOLD = "\033[1m"
+
+# Cross-thread and cross-process synchronization. Each table has its own lock,
+# while the lock file is held with flock() so API workers and the CLI coordinate.
+_TABLE_LOCKS: dict[str, threading.RLock] = {}
+_TABLE_LOCKS_GUARD = threading.Lock()
+SHARD_SIZE = 1000
+STORAGE_VERSION = 2
+
+
+def atomic_write_bytes(path: pathlib.Path, payload: bytes, mode: int | None = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if mode is not None:
+            os.chmod(temp_name, mode)
+        os.replace(temp_name, path)
+        with contextlib.suppress(OSError):
+            dir_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+    except Exception:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temp_name)
+        raise
+
+
+def atomic_write_text(path: pathlib.Path, value: str, mode: int | None = None) -> None:
+    atomic_write_bytes(path, value.encode("utf-8"), mode)
+
+
+def atomic_write_json(path: pathlib.Path, value: Any, mode: int | None = None) -> None:
+    atomic_write_text(path, json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n", mode)
+
+
+@contextlib.contextmanager
+def file_lock(lock_path: pathlib.Path, create_parent: bool = True):
+    key = str(lock_path.resolve())
+    with _TABLE_LOCKS_GUARD:
+        thread_lock = _TABLE_LOCKS.setdefault(key, threading.RLock())
+    with thread_lock:
+        if create_parent:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+        elif not lock_path.parent.is_dir():
+            raise FileNotFoundError(f"Lock parent directory no longer exists: {lock_path.parent}")
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+
+def table_lock(folder: pathlib.Path):
+    if not folder.is_dir():
+        raise FileNotFoundError(f"Table directory does not exist: {folder}")
+    return file_lock(folder / ".table.lock", create_parent=False)
+
+
+def clean_cell_value(value: Any) -> str:
+    value = str(value)
+    if "\n" in value or "\r" in value or "\x00" in value:
+        raise ValueError("Column values cannot contain line breaks or NUL characters.")
+    return value
 
 
 def cprint(text: str, color: str = GREEN) -> None:
@@ -375,7 +449,7 @@ def migrate_legacy_storage() -> None:
                         name, value = line.split("=", 1)
                         _, sep, interval = value.partition(":")
                         lines.append(f"{name}=false:{interval if sep and interval else '1h'}")
-                if lines: schedule.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                if lines: atomic_write_text(schedule, "\n".join(lines) + "\n", 0o600)
         archived_name = "pending-global-secrets" if not databases else "legacy-global-secrets"
         archived = runtime / archived_name
         if archived.exists(): archived = runtime / f"{archived_name}-{int(time.time())}"
@@ -384,7 +458,7 @@ def migrate_legacy_storage() -> None:
         archived = runtime / "legacy-global-backups"
         if archived.exists(): archived = runtime / f"legacy-global-backups-{int(time.time())}"
         with contextlib.suppress(OSError): legacy_backups.rename(archived)
-    marker.write_text("migrated\n", encoding="utf-8")
+    atomic_write_text(marker, "migrated\n", 0o600)
 
 
 def write_api_server_stub(db: str, api_type: str, api_dir: pathlib.Path) -> None:
@@ -394,8 +468,7 @@ def write_api_server_stub(db: str, api_type: str, api_dir: pathlib.Path) -> None
         "# DB_MANAGER_EXT_SERVER_STUB\n"
         f"exec bash {shlex.quote(str(SHELL_SCRIPT))} --db-manager-internal --serve {shlex.quote(db)} {shlex.quote(api_type)}\n"
     )
-    path.write_text(content, encoding="utf-8")
-    os.chmod(path, 0o700)
+    atomic_write_text(path, content, 0o700)
 
 
 def write_backup_server_stub(db: str, secrets_dir: pathlib.Path) -> None:
@@ -405,8 +478,7 @@ def write_backup_server_stub(db: str, secrets_dir: pathlib.Path) -> None:
         "# DB_MANAGER_EXT_BACKUP_STUB\n"
         f"exec bash {shlex.quote(str(SHELL_SCRIPT))} --db-manager-internal --worker {shlex.quote(db)} \"$1\" \"${{2:-300}}\"\n"
     )
-    path.write_text(content, encoding="utf-8")
-    os.chmod(path, 0o700)
+    atomic_write_text(path, content, 0o700)
 
 
 def ensure_db_layout(db: str) -> dict[str, pathlib.Path]:
@@ -427,7 +499,7 @@ def ensure_db_layout(db: str) -> dict[str, pathlib.Path]:
                 if "=" in line:
                     fn, value = line.split("=", 1); _, sep, interval = value.partition(":")
                     safe_lines.append(f"{fn}=false:{interval if sep and interval else '1h'}")
-            if safe_lines: schedule.write_text("\n".join(safe_lines) + "\n", encoding="utf-8")
+            if safe_lines: atomic_write_text(schedule, "\n".join(safe_lines) + "\n", 0o600)
         archived = ROOT / "runtime" / "legacy-global-secrets"
         if archived.exists(): archived = ROOT / "runtime" / f"legacy-global-secrets-{int(time.time())}"
         with contextlib.suppress(OSError): pending.rename(archived)
@@ -439,18 +511,19 @@ def ensure_db_layout(db: str) -> dict[str, pathlib.Path]:
         if api_type == "public":
             perm = api_dir / "permissions.cfg"
             if not perm.exists():
-                perm.write_text(
+                atomic_write_text(
+                    perm,
                     "show_tables=false\ndump_db=false\nselect_from=false\ninsert_into=false\n"
                     "create_table=false\ndrop_table=false\ndelete_from=false\ndelete_record=false\n"
                     "create_column=false\ndrop_column=false\nshow_columns=false\nrename_column=false\n"
-                    "update=false\nrename_table=false\n", encoding="utf-8")
+                    "update=false\nrename_table=false\n", 0o600)
     if not (d["base"] / f"{db}.db").exists():
-        (d["base"] / f"{db}.db").write_text(
-            json.dumps({"database": db, "tables": {}}, indent=2) + "\n", encoding="utf-8")
+        atomic_write_text(d["base"] / f"{db}.db",
+                          json.dumps({"database": db, "tables": {}}, indent=2) + "\n", 0o600)
     if not d["backup_cfg"].exists() or d["backup_cfg"].stat().st_size == 0:
         write_backup_config(d["backup_cfg"], default_backup_config())
     if not d["schedule_cfg"].exists() or d["schedule_cfg"].stat().st_size == 0:
-        d["schedule_cfg"].write_text("backup=false:1h\nbackup_delete=false:1d\n", encoding="utf-8")
+        atomic_write_text(d["schedule_cfg"], "backup=false:1h\nbackup_delete=false:1d\n", 0o600)
     if not d["keys_cfg"].exists():
         d["keys_cfg"].touch(mode=0o600)
     if not d["secrets_env"].exists():
@@ -477,7 +550,7 @@ def write_backup_config(path: pathlib.Path, cfg: dict[str, dict[str, str]]) -> N
         lines.append(f"[{section}]")
         lines.extend(f"{k}={v}" for k, v in values.items())
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    atomic_write_text(path, "\n".join(lines) + "\n", 0o600)
 
 
 def read_backup_config(db: str) -> dict[str, dict[str, str]]:
@@ -614,9 +687,7 @@ def key_records(db: str) -> list[tuple[str, str]]:
 def write_key_records(db: str, records: list[tuple[str, str]]) -> None:
     d = ensure_db_layout(db)
     tmp = d["keys_cfg"].with_suffix(".tmp")
-    tmp.write_text("".join(f"{k}={v}\n" for k, v in records), encoding="utf-8")
-    os.chmod(tmp, 0o600)
-    tmp.replace(d["keys_cfg"])
+    atomic_write_text(d["keys_cfg"], "".join(f"{k}={v}\n" for k, v in records), 0o600)
 
 
 def register_key(db: str, value: str) -> None:
@@ -666,9 +737,7 @@ def read_kv(path: pathlib.Path) -> dict[str, str]:
 def write_kv(path: pathlib.Path, data: dict[str, str], mode: int = 0o600) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text("".join(f"{k}={v}\n" for k, v in data.items()), encoding="utf-8")
-    os.chmod(tmp, mode)
-    tmp.replace(path)
+    atomic_write_text(path, "".join(f"{k}={v}\n" for k, v in data.items()), mode)
 
 
 def api_pair(db: str, api_type: str) -> tuple[str, str]:
@@ -759,11 +828,33 @@ ul {{ list-style-type: none; padding: 0; }} li {{ background: #334155; margin: 8
             return permissions.get(name, "false").lower() == "true"
 
         def authenticate(self, parsed: urllib.parse.SplitResult) -> bool:
-            values = urllib.parse.parse_qs(parsed.query, keep_blank_values=True).get("key", [])
-            if len(values) != 1 or "/" not in values[0]:
+            """Authenticate with Authorization: Bearer key1/key2 or legacy ?key=.
+
+            A supplied but malformed Authorization header is rejected instead of
+            silently falling back to query credentials. This prevents ambiguous
+            mixed-auth requests and keeps credentials out of URLs when headers
+            are available.
+            """
+            header_value = (self.headers.get("Authorization", "") or "").strip()
+            if header_value:
+                pieces = header_value.split(None, 1)
+                if len(pieces) != 2 or pieces[0].casefold() != "bearer":
+                    return False
+                credential = urllib.parse.unquote(pieces[1].strip())
+            else:
+                values = urllib.parse.parse_qs(parsed.query, keep_blank_values=True).get("key", [])
+                if len(values) != 1:
+                    return False
+                credential = values[0]
+
+            separator = next((sep for sep in ("/", ":", ",") if sep in credential), None)
+            if separator is None:
                 return False
-            first, second = values[0].split("/", 1)
-            return hmac.compare_digest(first, key1) and hmac.compare_digest(second, key2)
+            first, second = credential.split(separator, 1)
+            if not first or not second:
+                return False
+            return (hmac.compare_digest(first.strip(), key1)
+                    and hmac.compare_digest(second.strip(), key2))
 
         def do_GET(self) -> None: self._handle_api("GET")
         def do_POST(self) -> None: self._handle_api("POST")
@@ -786,14 +877,14 @@ ul {{ list-style-type: none; padding: 0; }} li {{ background: #334155; margin: 8
             path = path.rstrip("/") or "/"
             if api_type == "public":
                 now = time.monotonic()
-                recent = getattr(self.server, "requests_by_ip", {})
-                arr = [t for t in recent.get(self.client_address[0], []) if now - t < 5]
-                if len(arr) >= 10:
-                    self.send_json(429, {"status": "error", "error": "Rate limit exceeded."})
-                    return
-                arr.append(now)
-                recent[self.client_address[0]] = arr
-                self.server.requests_by_ip = recent
+                with self.server.rate_limit_lock:
+                    recent = self.server.requests_by_ip
+                    arr = [t for t in recent.get(self.client_address[0], []) if now - t < 5]
+                    if len(arr) >= 10:
+                        self.send_json(429, {"status": "error", "error": "Rate limit exceeded."})
+                        return
+                    arr.append(now)
+                    recent[self.client_address[0]] = arr
             body: dict[str, Any] = {}
             if method in ("POST", "PUT"):
                 length = int(self.headers.get("Content-Length", "0") or 0)
@@ -835,85 +926,69 @@ ul {{ list-style-type: none; padding: 0; }} li {{ background: #334155; margin: 8
                     out["tables"] = sorted(p.name for p in tables_dir.iterdir() if p.is_dir())
                 elif path.startswith(("/select_from/", "/select/")):
                     if not self.permission("select_from"): raise PermissionError("Permission denied for 'select_from'.")
-                    table = valid_name(path.rstrip("/").split("/")[-1], "table name")
-                    tdir = tables_dir / table
-                    if not tdir.is_dir(): code = 404; raise FileNotFoundError(f"Table '{table}' does not exist.")
-                    out.update({"table": table,
-                                "records": (tdir / "tables").read_text(encoding="utf-8").splitlines()})
+                    table = valid_name(urllib.parse.unquote(path.rstrip("/").split("/")[-1]), "table name")
+                    cols, rows, _ = read_table(db, table)
+                    filter_column = query.get("column")
+                    filter_value = query.get("value")
+                    if filter_column is not None:
+                        if filter_column not in cols: raise ValueError(f"Column '{filter_column}' does not exist.")
+                        rows = search_rows(db, table, filter_column, str(filter_value if filter_value is not None else ""), cols, rows)
+                    out.update({"table": table, "columns": cols, "records": rows})
                 elif path.startswith(("/insert_into/", "/insert/")):
                     if not self.permission("insert_into"): raise PermissionError("Permission denied for 'insert_into'.")
-                    table = valid_name(path.rstrip("/").split("/")[-1], "table name")
-                    tdir = tables_dir / table
-                    if not tdir.is_dir(): code = 404; raise FileNotFoundError(f"Table '{table}' does not exist.")
-                    cols = [x.strip() for x in (tdir / "columns").read_text(encoding="utf-8").splitlines() if x.strip()]
+                    table = valid_name(urllib.parse.unquote(path.rstrip("/").split("/")[-1]), "table name")
                     values = params.get("data") or params.get("record") or body.get("raw_body")
                     if values is None or values == "": raise ValueError("Missing data to insert.")
-                    data_file = tdir / "tables"
-                    lines = data_file.read_text(encoding="utf-8").splitlines() if data_file.exists() else []
-                    rows = []
-                    for line in lines:
-                        parts = [p.strip().replace("\n", " ").replace("\r", "") for p in line.split(" ")]
-                        while len(parts) < len(cols): parts.append("")
-                        rows.append(parts[:len(cols)])
-                    target_map = {}
-                    if isinstance(values, dict):
-                        for k, v in values.items():
-                            if k in cols and k != "id": target_map[cols.index(k)] = str(v).replace("\n", " ").replace("\r", "")
-                    else:
-                        raw = str(values).replace("\n", " ").replace("\r", "")
-                        parts = [p.strip() for p in raw.replace("|", " ").split(" ") if p.strip()]
-                        if parts and parts[0] in cols:
-                            i = 0
-                            while i < len(parts) - 1:
-                                col, val = parts[i], parts[i + 1]
-                                if col in cols and col != "id": target_map[cols.index(col)] = val; i += 2
-                                else: i += 1
-                        else:
-                            start = 1 if cols and cols[0] == "id" else 0
-                            for i, value in enumerate(parts):
-                                if start + i < len(cols): target_map[start + i] = value
-                    target_idx = None
-                    for r_idx, row_values in enumerate(rows):
-                        if target_map and all(row_values[idx] == "" for idx in target_map):
-                            target_idx = r_idx; break
-                    if target_idx is None:
-                        row = [""] * len(cols)
-                        if cols and cols[0] == "id": row[0] = str(len(rows) + 1)
-                        rows.append(row); target_idx = len(rows) - 1
-                    for idx, value in target_map.items(): rows[target_idx][idx] = value
-                    data_file.write_text("".join(" ".join(r) + "\n" for r in rows), encoding="utf-8")
-                    out.update({"message": f"Data successfully inserted into table '{table}'.", "inserted_data": rows[target_idx]})
+                    # api_append_record holds the table's RLock + flock across
+                    # schema lookup, ID allocation, shard write and manifest publish.
+                    inserted = api_append_record(db, table, values)
+                    out.update({"message": f"Data successfully appended to table '{table}'.",
+                                "inserted_data": inserted, "append_only": True,
+                                "storage": "locked_atomic"})
                 elif path.startswith("/create_table/"):
                     if not self.permission("create_table"): raise PermissionError("Permission denied for 'create_table'.")
                     table = valid_name(path.rstrip("/").split("/")[-1], "table name")
                     tdir = tables_dir / table
-                    if tdir.exists(): code = 409; raise FileExistsError(f"Table '{table}' already exists.")
-                    tdir.mkdir(parents=True); (tdir / "columns").write_text("id\n"); (tdir / "tables").touch()
+                    with file_lock(d["base"] / ".schema.lock"):
+                        if tdir.exists(): code = 409; raise FileExistsError(f"Table '{table}' already exists.")
+                        tdir.mkdir(parents=True)
+                        atomic_write_text(tdir / "columns", "id\n", 0o600)
+                        (tdir / "tables").touch()
+                        atomic_write_text(tdir / ".index_enabled", "true\n", 0o600)
+                        atomic_write_text(tdir / ".next_id", "1\n", 0o600)
                     out["message"] = f"Table '{table}' created successfully."
                 elif path.startswith("/drop_table/"):
                     if not self.permission("drop_table"): raise PermissionError("Permission denied for 'drop_table'.")
                     table = valid_name(path.rstrip("/").split("/")[-1], "table name")
                     tdir = tables_dir / table
-                    if not tdir.exists(): code = 404; raise FileNotFoundError(f"Table '{table}' does not exist.")
-                    shutil.rmtree(tdir); out["message"] = f"Table '{table}' dropped successfully."
+                    with file_lock(d["base"] / ".schema.lock"):
+                        if not tdir.is_dir(): code = 404; raise FileNotFoundError(f"Table '{table}' does not exist.")
+                        with table_lock(tdir):
+                            shutil.rmtree(tdir)
+                    out["message"] = f"Table '{table}' dropped successfully."
                 elif path.startswith("/delete_from/"):
                     if not self.permission("delete_from"): raise PermissionError("Permission denied for 'delete_from'.")
                     table = valid_name(path.rstrip("/").split("/")[-1], "table name")
                     tdir = tables_dir / table
                     if not tdir.exists(): code = 404; raise FileNotFoundError(f"Table '{table}' does not exist.")
-                    (tdir / "tables").write_text(""); out["message"] = f"All records deleted from table '{table}'."
+                    with edit_table(db, table) as (_cols, rows, _data_file):
+                        deleted_count = len(rows)
+                        rows.clear()
+                    out["message"] = f"All {deleted_count} records deleted from table '{table}'."
                 elif path.startswith("/delete_record/"):
                     if not self.permission("delete_record"): raise PermissionError("Permission denied for 'delete_record'.")
                     bits = path.strip("/").split("/")
                     if len(bits) < 3: code = 400; raise ValueError("Use /delete_record/<table>/<record>")
-                    table = valid_name(bits[1], "table name")
+                    table = valid_name(urllib.parse.unquote(bits[1]), "table name")
                     target = urllib.parse.unquote("/".join(bits[2:]))
-                    tdir = tables_dir / table
-                    if not tdir.exists(): code = 404; raise FileNotFoundError(f"Table '{table}' does not exist.")
-                    f = tdir / "tables"; old = f.read_text(encoding="utf-8").splitlines()
-                    new = [x for x in old if x.strip() != target]
-                    if len(new) == len(old): code = 404; raise FileNotFoundError("Record not found.")
-                    f.write_text("".join(x + "\n" for x in new)); out["message"] = "Record deleted successfully."
+                    # api_delete_record holds the table's RLock + flock for the
+                    # complete read/modify/atomic-generation-publish transaction.
+                    removed_count = api_delete_record(db, table, target)
+                    if not removed_count:
+                        code = 404
+                        raise FileNotFoundError("Record not found.")
+                    out.update({"message": "Record deleted successfully.",
+                                "deleted_records": removed_count, "storage": "locked_atomic"})
                 else:
                     out["message"] = f"Endpoint '{path}' reached and executed successfully."
             except PermissionError as exc:
@@ -931,6 +1006,8 @@ ul {{ list-style-type: none; padding: 0; }} li {{ background: #334155; margin: 8
         allow_reuse_address = True
 
     server = ThreadedHTTPServer((address, port), Handler)
+    server.requests_by_ip = {}
+    server.rate_limit_lock = threading.Lock()
     if proto == "https":
         api_dir = cfg_file.parent
         cert = api_dir / "server.crt"
@@ -1019,7 +1096,7 @@ def write_managed_pid(pid_file: pathlib.Path, proc: subprocess.Popen, token: str
     if not info:
         raise RuntimeError(f"Could not read process identity for PID {proc.pid}.")
     pid_file.parent.mkdir(parents=True, exist_ok=True)
-    pid_file.write_text(f"{proc.pid}\n", encoding="utf-8")
+    atomic_write_text(pid_file, f"{proc.pid}\n", 0o600)
     meta = {
         "pid": proc.pid,
         "pgid": info["pgid"],
@@ -1029,7 +1106,7 @@ def write_managed_pid(pid_file: pathlib.Path, proc: subprocess.Popen, token: str
         "script": str(SHELL_SCRIPT),
     }
     meta_path = process_meta_path(pid_file)
-    meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    atomic_write_text(meta_path, json.dumps(meta, indent=2) + "\n", 0o600)
     os.chmod(pid_file, 0o600)
     os.chmod(meta_path, 0o600)
 
@@ -1858,7 +1935,7 @@ def backup_schedule(db: str, args: list[str]) -> None:
         if "=" in line:
             k, v = line.split("=", 1); entries[k.strip()] = v.strip()
     entries[func] = f"{status}:{interval}"
-    d["schedule_cfg"].write_text("".join(f"{k}={v}\n" for k, v in entries.items()), encoding="utf-8")
+    atomic_write_text(d["schedule_cfg"], "".join(f"{k}={v}\n" for k, v in entries.items()), 0o600)
     pid_file = d["secrets"] / f"backup_{func}.pid"
     if status == "true":
         stop_backup_worker(db, func)
@@ -1978,7 +2055,7 @@ def db_rename(args: list[str]) -> None:
     meta = dst / f"{old}.db"
     if meta.exists():
         data = json.loads(meta.read_text(encoding="utf-8")); data["database"] = new
-        (dst / f"{new}.db").write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        atomic_write_text(dst / f"{new}.db", json.dumps(data, indent=2) + "\n", 0o600)
         meta.unlink()
     cprint(f"Database '{old}' renamed to '{new}' successfully.")
     for kind in active_apis:
@@ -2034,27 +2111,23 @@ def table_show(db: str, args: list[str]) -> None:
     d = ensure_db_layout(db)
     if args:
         table = valid_name(args[0], "table name")
-        tdir = d["tables"] / table
-        if not tdir.is_dir(): raise FileNotFoundError(f"Table '{table}' does not exist in database '{db}'.")
-        cols = [x.rstrip("\r\n") for x in (tdir / "columns").read_text(encoding="utf-8").splitlines() if x.strip()]
-        records = [x.rstrip("\r\n") for x in (tdir / "tables").read_text(encoding="utf-8").splitlines() if x.strip()]
-        rows = [cols] + [[x for x in r.split(" ")] for r in records]
+        cols, records, _ = read_table(db, table)
+        rows = [cols] + records
         n = len(cols)
-        for row in rows:
-            if len(row) < n: row.extend([""] * (n - len(row)))
-            del row[n:]
-        widths = [max(4, *(len(r[i]) for r in rows)) for i in range(n)]
+        widths = [max(4, *(len(str(r[i])) for r in rows)) for i in range(n)]
         def rowfmt(row: list[str]) -> str:
-            return "│ " + " │ ".join(row[i].ljust(widths[i]) for i in range(n)) + " │"
+            return "│ " + " │ ".join(str(row[i]).ljust(widths[i]) for i in range(n)) + " │"
         print(f"{CYAN}{BOLD}Complete Table View: '{table}'{RESET}")
         print("┌" + "┬".join("─" * (w + 2) for w in widths) + "┐")
-        print(rowfmt(rows[0]))
+        print(rowfmt(cols))
         print("├" + "┼".join("─" * (w + 2) for w in widths) + "┤")
-        if len(rows) == 1: print(rowfmt([""] * n))
-        else:
-            for idx, row in enumerate(rows[1:]):
+        if records:
+            for idx, row in enumerate(records):
                 print(rowfmt(row))
-                if idx < len(rows) - 2: print("├" + "┼".join("─" * (w + 2) for w in widths) + "┤")
+                if idx < len(records) - 1:
+                    print("├" + "┼".join("─" * (w + 2) for w in widths) + "┤")
+        else:
+            print(rowfmt([""] * n))
         print("└" + "┴".join("─" * (w + 2) for w in widths) + "┘")
         return
     tables = sorted(p.name for p in d["tables"].iterdir() if p.is_dir())
@@ -2068,62 +2141,48 @@ def table_show(db: str, args: list[str]) -> None:
     for name in tables: print("│ " + f"{name:<{width}}" + " │")
     print("└" + "─" * (width + 2) + "┘")
 
-
-def table_insert(db: str, args: list[str]) -> None:
-    if len(args) < 2: raise ValueError("Usage: insert_into <table> <column> <value> [<column> <value> ...] or insert_into <table> value1|value2")
-    d = ensure_db_layout(db)
-    table = valid_name(args[0], "table name")
-    tdir = d["tables"] / table
-    if not tdir.is_dir(): raise FileNotFoundError(f"Table '{table}' does not exist.")
-    cols = [x.strip() for x in (tdir / "columns").read_text(encoding="utf-8").splitlines() if x.strip()]
-    if not cols: cols = ["id"]
-    row = [""] * len(cols)
-    rest = args[1:]
+def parse_insert_mapping(cols: list[str], args: list[str]) -> dict[int, str]:
+    if not args:
+        raise ValueError("No values were provided for insert_into.")
+    rest = args[:]
     mapping: dict[int, str] = {}
     if len(rest) == 1 and "|" in rest[0]:
-        vals = rest[0].split("|")
-        start = 1 if cols[0] == "id" else 0
-        for i, v in enumerate(vals):
-            if start + i < len(cols): mapping[start + i] = v
+        values = rest[0].split("|")
+        start = 1 if cols and cols[0] == "id" else 0
+        for i, value in enumerate(values):
+            if start + i < len(cols): mapping[start + i] = clean_cell_value(value)
     elif rest[0] in cols:
-        if len(rest) % 2: raise ValueError("Column/value pairs are incomplete. Provide a value for every column.")
+        if len(rest) % 2:
+            raise ValueError('Column/value pairs are incomplete. Quote values containing spaces, e.g. insert_into people name "John Doe".')
         i = 0
         while i < len(rest):
-            col = rest[i]
-            if col not in cols: raise ValueError(f"Column '{col}' does not exist in table '{table}'.")
+            col, value = rest[i], rest[i + 1]
+            if col not in cols: raise ValueError(f"Column '{col}' does not exist.")
             if col == "id": raise ValueError("The primary id column is generated automatically.")
-            mapping[cols.index(col)] = rest[i + 1]
+            mapping[cols.index(col)] = clean_cell_value(value)
             i += 2
     else:
-        start = 1 if cols[0] == "id" else 0
-        for i, v in enumerate(rest):
-            if start + i < len(cols): mapping[start + i] = v
-    if not mapping: raise ValueError("No valid column values were provided.")
-    data_file = tdir / "tables"
-    old = [line.rstrip("\r\n") for line in data_file.read_text(encoding="utf-8").splitlines() if line.strip()] if data_file.exists() else []
-    rows = []
-    for line in old:
-        values = line.split(" ")
-        values += [""] * (len(cols) - len(values))
-        rows.append(values[:len(cols)])
-    # Retain the original manager's behaviour: fill a fully empty slot if one exists, otherwise append.
-    slot = next((i for i, values in enumerate(rows) if all(values[k] == "" for k in mapping)), None)
-    if slot is None:
-        row = [""] * len(cols)
-        if cols[0] == "id": row[0] = str(len(rows) + 1)
-        rows.append(row); slot = len(rows) - 1
-    elif cols[0] == "id" and not rows[slot][0]:
-        rows[slot][0] = str(slot + 1)
-    for idx, value in mapping.items():
-        if any(ch.isspace() for ch in value):
-            raise ValueError("Values cannot contain spaces in the current text-table storage format.")
-        rows[slot][idx] = value.replace("\n", "").replace("\r", "")
-    tmp = data_file.with_suffix(".tmp")
-    tmp.write_text("".join(" ".join(values) + "\n" for values in rows), encoding="utf-8")
-    tmp.replace(data_file)
-    values_desc = ", ".join(f"{cols[i]}='{rows[slot][i]}'" for i in mapping)
-    cprint(f"Table '{table}': inserted data ({values_desc}).")
+        start = 1 if cols and cols[0] == "id" else 0
+        for i, value in enumerate(rest):
+            if start + i < len(cols): mapping[start + i] = clean_cell_value(value)
+    if not mapping:
+        raise ValueError("No valid column values were provided.")
+    return mapping
 
+
+def table_insert(db: str, args: list[str]) -> None:
+    if len(args) < 2:
+        raise ValueError('Usage: insert_into <table> <column> "<value with spaces>" [<column> "<value>"]')
+    table = valid_name(args[0], "table name")
+    d = ensure_db_layout(db)
+    folder = d["tables"] / table
+    if not folder.is_dir(): raise FileNotFoundError(f"Table '{table}' does not exist.")
+    with table_lock(folder):
+        cols, _, _ = _read_table_unlocked(folder)
+        mapping = parse_insert_mapping(cols, args[1:])
+        row = _append_mapping_unlocked(folder, cols, mapping)
+    values_desc = ", ".join(f"{cols[i]}='{row[i]}'" for i in mapping)
+    cprint(f"Table '{table}': appended record ID {row[0]} ({values_desc}).")
 
 def readline_main(db: str, host: str, output_file: str) -> None:
     migrate_legacy_storage()
@@ -2171,29 +2230,365 @@ def table_paths(db: str, table: str) -> tuple[pathlib.Path, pathlib.Path, pathli
     return folder, folder / "columns", folder / "tables"
 
 
+def _storage_paths(folder: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
+    storage = folder / ".storage"
+    return storage, storage / "manifest.json", storage / "generations"
+
+
+def _read_columns_unlocked(folder: pathlib.Path) -> list[str]:
+    path = folder / "columns"
+    cols = [x.strip() for x in path.read_text(encoding="utf-8", errors="replace").splitlines() if x.strip()] if path.exists() else ["id"]
+    return cols or ["id"]
+
+
+def _legacy_rows_unlocked(folder: pathlib.Path, cols: list[str]) -> list[list[str]]:
+    legacy = folder / "tables"
+    rows: list[list[str]] = []
+    if not legacy.exists(): return rows
+    next_id = 1
+    for line in legacy.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip(): continue
+        # Legacy rows were whitespace-delimited. shlex preserves cells that
+        # were quoted by compatible writers (e.g. "New York") while retaining
+        # backwards compatibility with older simple, unquoted rows.
+        try:
+            values = shlex.split(line, comments=False, posix=True)
+        except ValueError as exc:
+            raise RuntimeError(f"Invalid legacy row in {legacy}: {exc}") from exc
+        values.extend([""] * max(0, len(cols) - len(values)))
+        row = values[:len(cols)]
+        if cols[0] == "id":
+            try:
+                rid = int(row[0])
+                if rid <= 0: raise ValueError
+            except (ValueError, TypeError):
+                row[0] = str(next_id)
+            next_id = max(next_id, int(row[0]) + 1)
+        rows.append(row)
+    return rows
+
+
+def _read_manifest_unlocked(folder: pathlib.Path) -> dict[str, Any] | None:
+    _, manifest_path, _ = _storage_paths(folder)
+    if not manifest_path.is_file(): return None
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if data.get("version") != STORAGE_VERSION or not isinstance(data.get("shards"), dict):
+            raise ValueError("Unsupported table storage manifest.")
+        return data
+    except Exception as exc:
+        raise RuntimeError(f"Table storage manifest is corrupt: {manifest_path}: {exc}") from exc
+
+
+def _load_shard_rows_unlocked(folder: pathlib.Path, manifest: dict[str, Any], cols: list[str]) -> list[list[str]]:
+    storage, _, generations = _storage_paths(folder)
+    generation_dir = generations / str(manifest["generation"])
+    rows_with_ids: list[tuple[int, list[str]]] = []
+    for _, filename in sorted(manifest["shards"].items(), key=lambda item: int(item[0])):
+        shard_path = generation_dir / filename
+        if not shard_path.is_file():
+            raise RuntimeError(f"Missing table shard: {shard_path}")
+        with shard_path.open("r", encoding="utf-8") as stream:
+            for line_no, line in enumerate(stream, 1):
+                if not line.strip(): continue
+                try:
+                    item = json.loads(line)
+                    row = [str(v) for v in item["values"]]
+                    rid = int(item["id"])
+                    if not row: row = [str(rid)]
+                    row.extend([""] * max(0, len(cols) - len(row)))
+                    row = row[:len(cols)]
+                    if cols[0] == "id": row[0] = str(rid)
+                    rows_with_ids.append((rid, row))
+                except Exception as exc:
+                    raise RuntimeError(f"Invalid JSONL record in {shard_path}:{line_no}: {exc}") from exc
+    rows_with_ids.sort(key=lambda pair: pair[0])
+    return [row for _, row in rows_with_ids]
+
+
+def _index_enabled_unlocked(folder: pathlib.Path) -> bool:
+    marker = folder / ".index_enabled"
+    if not marker.exists():
+        atomic_write_text(marker, "true\n", 0o600)
+        return True
+    return marker.read_text(encoding="utf-8", errors="replace").strip().lower() != "false"
+
+
+def _build_index(cols: list[str], rows: list[list[str]]) -> dict[str, dict[str, list[int]]]:
+    index: dict[str, dict[str, list[int]]] = {col: {} for col in cols}
+    for row in rows:
+        if not row: continue
+        try: rid = int(row[0])
+        except (ValueError, TypeError): continue
+        for i, col in enumerate(cols):
+            value = row[i] if i < len(row) else ""
+            index[col].setdefault(value, []).append(rid)
+    return index
+
+
+def _commit_rows_unlocked(folder: pathlib.Path, cols: list[str], rows: list[list[str]]) -> None:
+    """Write a complete new generation, then atomically publish its manifest.
+
+    Readers see either the previous generation or the complete new generation;
+    an interrupted write leaves only an ignored temporary generation behind.
+    """
+    storage, manifest_path, generations = _storage_paths(folder)
+    generations.mkdir(parents=True, exist_ok=True)
+    previous = _read_manifest_unlocked(folder)
+    generation = uuid.uuid4().hex
+    generation_dir = generations / generation
+    generation_dir.mkdir(mode=0o700)
+    try:
+        grouped: dict[int, list[dict[str, Any]]] = {}
+        max_id = 0
+        seen_ids: set[int] = set()
+        for source_row in rows:
+            row = [clean_cell_value(v) for v in source_row[:len(cols)]]
+            row.extend([""] * max(0, len(cols) - len(row)))
+            try: rid = int(row[0])
+            except (ValueError, TypeError): raise ValueError("Every stored record must have a numeric primary ID.")
+            if rid < 1: raise ValueError("Primary record IDs must be positive.")
+            if rid in seen_ids: raise ValueError(f"Duplicate primary record ID detected: {rid}.")
+            seen_ids.add(rid)
+            max_id = max(max_id, rid)
+            block = (rid - 1) // SHARD_SIZE
+            grouped.setdefault(block, []).append({"id": rid, "values": row})
+        shard_map: dict[str, str] = {}
+        for block, items in sorted(grouped.items()):
+            filename = f"shard_{block:08d}.jsonl"
+            content = "".join(json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n" for item in sorted(items, key=lambda x: x["id"]))
+            atomic_write_text(generation_dir / filename, content, 0o600)
+            shard_map[str(block)] = filename
+        index_name = None
+        if _index_enabled_unlocked(folder):
+            index_name = "index.json"
+            atomic_write_json(generation_dir / index_name, _build_index(cols, rows), 0o600)
+        manifest = {"version": STORAGE_VERSION, "generation": generation, "shards": shard_map,
+                    "columns": list(cols), "index": index_name, "record_count": len(rows),
+                    "max_id": max_id, "shard_size": SHARD_SIZE}
+        atomic_write_json(manifest_path, manifest, 0o600)
+        next_id_file = folder / ".next_id"
+        try: next_id = int(next_id_file.read_text().strip())
+        except (OSError, ValueError): next_id = max_id + 1
+        atomic_write_text(next_id_file, f"{max(next_id, max_id + 1)}\n", 0o600)
+        # The manifest is committed. Old generations are now safe to remove.
+        for old_dir in generations.iterdir():
+            if old_dir.is_dir() and old_dir.name != generation:
+                shutil.rmtree(old_dir, ignore_errors=True)
+    except Exception:
+        shutil.rmtree(generation_dir, ignore_errors=True)
+        raise
+
+
+def _ensure_storage_unlocked(folder: pathlib.Path, cols: list[str]) -> dict[str, Any]:
+    manifest = _read_manifest_unlocked(folder)
+    if manifest is not None:
+        return manifest
+    storage, _, generations = _storage_paths(folder)
+    storage.mkdir(parents=True, exist_ok=True)
+    generations.mkdir(parents=True, exist_ok=True)
+    rows = _legacy_rows_unlocked(folder, cols)
+    _commit_rows_unlocked(folder, cols, rows)
+    manifest = _read_manifest_unlocked(folder)
+    if manifest is None: raise RuntimeError("Could not initialize table storage.")
+    return manifest
+
+
+def _read_table_unlocked(folder: pathlib.Path) -> tuple[list[str], list[list[str]], pathlib.Path]:
+    if not folder.is_dir(): raise FileNotFoundError(f"Table directory does not exist: {folder}")
+    manifest = _read_manifest_unlocked(folder)
+    if manifest is not None and isinstance(manifest.get("columns"), list) and manifest["columns"]:
+        cols = [str(c) for c in manifest["columns"]]
+    else:
+        cols = _read_columns_unlocked(folder)
+    manifest = _ensure_storage_unlocked(folder, cols)
+    # The manifest is authoritative, so an interrupted schema update cannot
+    # expose new columns with an old shard generation (or vice versa).
+    cols = [str(c) for c in manifest.get("columns", cols)]
+    rows = _load_shard_rows_unlocked(folder, manifest, cols)
+    return cols, rows, folder / "tables"
+
+
+def _append_mapping_unlocked(folder: pathlib.Path, cols: list[str], mapping: dict[int, str]) -> list[str]:
+    _, rows, _ = _read_table_unlocked(folder)
+    next_id_file = folder / ".next_id"
+    try: next_id = int(next_id_file.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError): next_id = max((int(r[0]) for r in rows if r and r[0].isdigit()), default=0) + 1
+    next_id = max(next_id, max((int(r[0]) for r in rows if r and r[0].isdigit()), default=0) + 1)
+    row = [""] * len(cols)
+    if cols and cols[0] == "id": row[0] = str(next_id)
+    for idx, value in mapping.items():
+        if idx < 0 or idx >= len(cols): raise ValueError("Invalid column index for insert.")
+        if idx == 0 and cols[0] == "id": raise ValueError("The primary id column is generated automatically.")
+        row[idx] = clean_cell_value(value)
+    # Append-only semantics: never search for or overwrite an empty row slot.
+    rows.append(row)
+    atomic_write_text(next_id_file, f"{next_id + 1}\n", 0o600)
+    _commit_rows_unlocked(folder, cols, rows)
+    return row
+
+
+def append_record(db: str, table: str, mapping: dict[str, Any]) -> list[str]:
+    folder, columns_file, _ = table_paths(db, table)
+    if not folder.is_dir(): raise FileNotFoundError(f"Table '{table}' does not exist.")
+    with table_lock(folder):
+        cols, _, _ = _read_table_unlocked(folder)
+        col_mapping: dict[int, str] = {}
+        for col, value in mapping.items():
+            if col not in cols: raise ValueError(f"Column '{col}' does not exist in table '{table}'.")
+            idx = cols.index(col)
+            if col == "id": raise ValueError("The primary id column is generated automatically.")
+            col_mapping[idx] = clean_cell_value(value)
+        if not col_mapping: raise ValueError("No valid column values were provided.")
+        return _append_mapping_unlocked(folder, cols, col_mapping)
+
+
+def api_append_record(db: str, table: str, values: Any) -> list[str]:
+    """Append an API record under one cross-thread/process critical section.
+
+    The schema read, mapping validation, ID allocation, shard generation and
+    manifest publication happen while the same table lock is held. The storage
+    generation and manifest are written atomically by _commit_rows_unlocked().
+    """
+    folder, _, _ = table_paths(db, table)
+    if not folder.is_dir():
+        raise FileNotFoundError(f"Table '{table}' does not exist.")
+    with table_lock(folder):
+        cols, _, _ = _read_table_unlocked(folder)
+        if isinstance(values, dict):
+            mapping = {str(k): v for k, v in values.items()}
+        elif isinstance(values, list):
+            start = 1 if cols and cols[0] == "id" else 0
+            mapping = {cols[start + i]: value for i, value in enumerate(values)
+                       if start + i < len(cols)}
+        else:
+            raw = clean_cell_value(values)
+            parts = raw.split("|")
+            start = 1 if cols and cols[0] == "id" else 0
+            mapping = {cols[start + i]: value for i, value in enumerate(parts)
+                       if start + i < len(cols)}
+
+        col_mapping: dict[int, str] = {}
+        for column, value in mapping.items():
+            if column not in cols:
+                raise ValueError(f"Column '{column}' does not exist in table '{table}'.")
+            if column == "id":
+                raise ValueError("The primary id column is generated automatically.")
+            col_mapping[cols.index(column)] = clean_cell_value(value)
+        if not col_mapping:
+            raise ValueError("No valid column values were provided.")
+        return _append_mapping_unlocked(folder, cols, col_mapping)
+
+
+def api_delete_record(db: str, table: str, target: str) -> int:
+    """Delete matching API record(s) with flock + atomic manifest publication."""
+    folder, _, _ = table_paths(db, table)
+    if not folder.is_dir():
+        raise FileNotFoundError(f"Table '{table}' does not exist.")
+    with table_lock(folder):
+        cols, rows, _ = _read_table_unlocked(folder)
+        remaining = [row for row in rows
+                     if json.dumps(row, ensure_ascii=False) != target and " ".join(row) != target]
+        removed = len(rows) - len(remaining)
+        if removed:
+            _commit_rows_unlocked(folder, cols, remaining)
+        return removed
+
+
 def read_table(db: str, table: str) -> tuple[list[str], list[list[str]], pathlib.Path]:
-    folder, columns_file, data_file = table_paths(db, table)
+    """Read a consistent table snapshot; JSONL cells preserve embedded spaces."""
+    folder, _, _ = table_paths(db, table)
     if not folder.is_dir():
         raise FileNotFoundError(f"Table '{table}' does not exist in database '{db}'.")
-    cols = [x.strip() for x in columns_file.read_text(encoding="utf-8").splitlines() if x.strip()] if columns_file.exists() else ["id"]
-    if not cols:
-        cols = ["id"]
-    rows: list[list[str]] = []
-    if data_file.exists():
-        for line in data_file.read_text(encoding="utf-8", errors="replace").splitlines():
-            if not line.strip():
-                continue
-            values = line.split(" ")
-            values.extend([""] * max(0, len(cols) - len(values)))
-            rows.append(values[:len(cols)])
-    return cols, rows, data_file
+    with table_lock(folder):
+        cols, rows, data_file = _read_table_unlocked(folder)
+        # Do not split, strip or normalize cell strings: spaces are data.
+        rows = [[str(value) for value in row] for row in rows]
+        return cols, rows, data_file
 
 
 def write_table(columns: list[str], rows: list[list[str]], data_file: pathlib.Path) -> None:
-    tmp = data_file.with_suffix(data_file.suffix + ".tmp")
-    tmp.write_text("".join(" ".join(row[:len(columns)]) + "\n" for row in rows), encoding="utf-8")
-    tmp.replace(data_file)
+    folder = data_file.parent
+    with table_lock(folder):
+        if not columns: columns = ["id"]
+        atomic_write_text(folder / "columns", "".join(c + "\n" for c in columns), 0o600)
+        _ensure_storage_unlocked(folder, columns)
+        _commit_rows_unlocked(folder, columns, rows)
 
+
+@contextlib.contextmanager
+def edit_table(db: str, table: str):
+    folder, _, data_file = table_paths(db, table)
+    if not folder.is_dir(): raise FileNotFoundError(f"Table '{table}' does not exist in database '{db}'.")
+    with table_lock(folder):
+        cols, rows, _ = _read_table_unlocked(folder)
+        yield cols, rows, data_file
+        atomic_write_text(folder / "columns", "".join(c + "\n" for c in cols), 0o600)
+        _commit_rows_unlocked(folder, cols, rows)
+
+
+def replace_table_rows(db: str, table: str, cols: list[str], rows: list[list[str]]) -> None:
+    folder, _, _ = table_paths(db, table)
+    with table_lock(folder):
+        _ensure_storage_unlocked(folder, cols)
+        _commit_rows_unlocked(folder, cols, rows)
+
+
+def search_rows(db: str, table: str, column: str, value: str,
+                cols: list[str] | None = None, rows: list[list[str]] | None = None) -> list[list[str]]:
+    folder, _, _ = table_paths(db, table)
+    with table_lock(folder):
+        current_cols, current_rows, _ = _read_table_unlocked(folder)
+        # Always search the same locked snapshot as the index manifest; callers
+        # cannot pass a stale row snapshot from before a concurrent update.
+        if column not in current_cols: raise ValueError(f"Column '{column}' does not exist in table '{table}'.")
+        manifest = _read_manifest_unlocked(folder) or {}
+        index_name = manifest.get("index")
+        if index_name:
+            generation_dir = _storage_paths(folder)[2] / str(manifest["generation"])
+            index_path = generation_dir / index_name
+            try:
+                index = json.loads(index_path.read_text(encoding="utf-8"))
+                ids = set(index.get(column, {}).get(value, []))
+                return [row for row in current_rows if row and int(row[0]) in ids]
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                pass
+        idx = current_cols.index(column)
+        return [row for row in current_rows if idx < len(row) and row[idx] == value]
+
+
+def search_table(db: str, args: list[str]) -> None:
+    if len(args) < 3: raise ValueError('Usage: search <table> <column> "<value with spaces>"')
+    table, column = args[0], args[1]
+    value = " ".join(args[2:])
+    cols, rows = read_table(db, table)[:2]
+    matches = search_rows(db, table, column, value, cols, rows)
+    print(f"{CYAN}{BOLD}Search results: {table}.{column} = '{value}'{RESET}")
+    if not matches:
+        print("  (No matching records)")
+        return
+    for row in matches:
+        print("  " + json.dumps(dict(zip(cols, row)), ensure_ascii=False))
+
+
+def index_command(db: str, args: list[str]) -> None:
+    if len(args) != 2: raise ValueError("Usage: index <table> <on|off|rebuild|status>")
+    table, action = args[0], args[1].lower()
+    folder, _, _ = table_paths(db, table)
+    if not folder.is_dir(): raise FileNotFoundError(f"Table '{table}' does not exist.")
+    with table_lock(folder):
+        cols, rows, _ = _read_table_unlocked(folder)
+        marker = folder / ".index_enabled"
+        if action == "status":
+            enabled = _index_enabled_unlocked(folder)
+            manifest = _read_manifest_unlocked(folder) or {}
+            print(f"Index for '{table}': {'enabled' if enabled and manifest.get('index') else 'disabled'}")
+            return
+        if action not in ("on", "off", "rebuild"):
+            raise ValueError("Index action must be on, off, rebuild or status.")
+        atomic_write_text(marker, ("false" if action == "off" else "true") + "\n", 0o600)
+        _commit_rows_unlocked(folder, cols, rows)
+        cprint(f"Index for table '{table}' is now {'disabled' if action == 'off' else 'enabled and rebuilt'}.")
 
 def list_databases() -> None:
     items = sorted(p.name for p in DB_ROOT.iterdir() if p.is_dir() and (p / f"{p.name}.db").is_file()) if DB_ROOT.exists() else []
@@ -2241,28 +2636,33 @@ def table_create(db: str, names: list[str]) -> None:
     if not names:
         raise ValueError("Usage: create_table <name>")
     d = ensure_db_layout(db)
-    for name in names:
-        folder = d["tables"] / valid_name(name, "table name")
-        if folder.exists():
-            cprint(f"Error: Table '{name}' already exists.", RED)
-            continue
-        folder.mkdir(parents=True)
-        (folder / "columns").write_text("id\n", encoding="utf-8")
-        (folder / "tables").touch()
-        cprint(f"Table '{name}' created successfully.")
+    with file_lock(d["base"] / ".schema.lock"):
+        for name in names:
+            folder = d["tables"] / valid_name(name, "table name")
+            if folder.exists():
+                cprint(f"Error: Table '{name}' already exists.", RED)
+                continue
+            folder.mkdir(parents=True)
+            atomic_write_text(folder / "columns", "id\n", 0o600)
+            (folder / "tables").touch()
+            atomic_write_text(folder / ".index_enabled", "true\n", 0o600)
+            atomic_write_text(folder / ".next_id", "1\n", 0o600)
+            cprint(f"Table '{name}' created successfully.")
 
 
 def table_drop(db: str, names: list[str]) -> None:
     if not names:
         raise ValueError("Usage: drop_table <name>")
     d = ensure_db_layout(db)
-    for name in names:
-        folder = d["tables"] / valid_name(name, "table name")
-        if not folder.is_dir():
-            cprint(f"Error: Table '{name}' does not exist.", RED)
-            continue
-        shutil.rmtree(folder)
-        cprint(f"Table '{name}' dropped successfully.")
+    with file_lock(d["base"] / ".schema.lock"):
+        for name in names:
+            folder = d["tables"] / valid_name(name, "table name")
+            if not folder.is_dir():
+                cprint(f"Error: Table '{name}' does not exist.", RED)
+                continue
+            with table_lock(folder):
+                shutil.rmtree(folder)
+            cprint(f"Table '{name}' dropped successfully.")
 
 
 def table_rename(db: str, args: list[str]) -> None:
@@ -2272,44 +2672,36 @@ def table_rename(db: str, args: list[str]) -> None:
     d = ensure_db_layout(db)
     src = d["tables"] / valid_name(old, "table name")
     dst = d["tables"] / valid_name(new, "table name")
-    if not src.is_dir(): raise FileNotFoundError(f"Table '{old}' does not exist.")
-    if dst.exists(): raise FileExistsError(f"Table '{new}' already exists.")
-    src.rename(dst)
+    with file_lock(d["base"] / ".schema.lock"):
+        if not src.is_dir(): raise FileNotFoundError(f"Table '{old}' does not exist.")
+        if dst.exists(): raise FileExistsError(f"Table '{new}' already exists.")
+        with table_lock(src):
+            src.rename(dst)
     cprint(f"Table '{old}' renamed to '{new}' successfully.")
-
-
 def column_create(db: str, args: list[str]) -> None:
     if len(args) < 2: raise ValueError("Usage: create_column <table> <column> [column ...]")
     table, names = args[0], args[1:]
-    cols, rows, data_file = read_table(db, table)
-    for name in names:
-        valid_name(name, "column name")
-        if name in cols:
-            cprint(f"Error: Column '{name}' already exists in table '{table}'.", RED)
-            continue
-        cols.append(name)
-        for row in rows: row.append("")
-        cprint(f"Column '{name}' added to table '{table}'.")
-    folder, columns_file, _ = table_paths(db, table)
-    columns_file.write_text("".join(c + "\n" for c in cols), encoding="utf-8")
-    write_table(cols, rows, data_file)
-
+    with edit_table(db, table) as (cols, rows, _):
+        for name in names:
+            valid_name(name, "column name")
+            if name in cols:
+                cprint(f"Error: Column '{name}' already exists in table '{table}'.", RED)
+                continue
+            cols.append(name)
+            for row in rows: row.append("")
+            cprint(f"Column '{name}' added to table '{table}'.")
 
 def column_drop(db: str, args: list[str]) -> None:
     if len(args) != 2: raise ValueError("Usage: drop_column <table> <column>")
     table, name = args
-    cols, rows, data_file = read_table(db, table)
-    if name not in cols: raise ValueError(f"Column '{name}' does not exist in table '{table}'.")
-    if name == "id": raise ValueError("Cannot drop primary id column.")
-    index = cols.index(name)
-    cols.pop(index)
-    for row in rows:
-        if index < len(row): row.pop(index)
-    _, columns_file, _ = table_paths(db, table)
-    columns_file.write_text("".join(c + "\n" for c in cols), encoding="utf-8")
-    write_table(cols, rows, data_file)
+    with edit_table(db, table) as (cols, rows, _):
+        if name not in cols: raise ValueError(f"Column '{name}' does not exist in table '{table}'.")
+        if name == "id": raise ValueError("Cannot drop primary id column.")
+        index = cols.index(name)
+        cols.pop(index)
+        for row in rows:
+            if index < len(row): row.pop(index)
     cprint(f"Column '{name}' dropped from table '{table}'.")
-
 
 def column_show(db: str, table: str) -> None:
     cols, _, _ = read_table(db, table)
@@ -2325,14 +2717,11 @@ def column_rename(db: str, args: list[str]) -> None:
     if len(args) != 3: raise ValueError("Usage: rename_column <table> <column> <newcolumn>")
     table, old, new = args
     valid_name(new, "column name")
-    cols, _, _ = read_table(db, table)
-    if old not in cols: raise ValueError(f"Column '{old}' does not exist.")
-    if new in cols: raise ValueError(f"Column '{new}' already exists.")
-    cols[cols.index(old)] = new
-    _, columns_file, _ = table_paths(db, table)
-    columns_file.write_text("".join(c + "\n" for c in cols), encoding="utf-8")
+    with edit_table(db, table) as (cols, rows, _):
+        if old not in cols: raise ValueError(f"Column '{old}' does not exist.")
+        if new in cols: raise ValueError(f"Column '{new}' already exists.")
+        cols[cols.index(old)] = new
     cprint(f"Column '{old}' renamed to '{new}'.")
-
 
 def select_tables(db: str, names: list[str]) -> None:
     if not names: raise ValueError("Usage: select_from <table>")
@@ -2341,48 +2730,47 @@ def select_tables(db: str, names: list[str]) -> None:
 
 
 def update_rows(db: str, args: list[str]) -> None:
-    if len(args) != 4: raise ValueError("Usage: update <table> <column> <value> <newvalue>")
+    if len(args) != 4: raise ValueError('Usage: update <table> <column> "<value>" "<newvalue>"')
     table, col, old, new = args
-    cols, rows, data_file = read_table(db, table)
-    if col not in cols: raise ValueError(f"Column '{col}' does not exist.")
-    if any(ch.isspace() for ch in new): raise ValueError("Values cannot contain spaces in the current text-table storage format.")
-    idx = cols.index(col)
-    count = 0
-    for row in rows:
-        if row[idx] == old:
-            row[idx] = new
-            count += 1
-    write_table(cols, rows, data_file)
+    # shlex-based CLI parsing keeps quoted values such as "New York" as one
+    # argument; clean both sides without trimming meaningful cell whitespace.
+    old = clean_cell_value(old)
+    new = clean_cell_value(new)
+    with edit_table(db, table) as (cols, rows, _):
+        if col not in cols: raise ValueError(f"Column '{col}' does not exist.")
+        idx = cols.index(col)
+        count = 0
+        for row in rows:
+            if row[idx] == old:
+                row[idx] = new
+                count += 1
     cprint(f"Updated {count} record(s).")
-
 
 def delete_rows(db: str, args: list[str]) -> None:
     if len(args) != 1: raise ValueError("Usage: delete_from <table>")
     table = args[0]
-    cols, rows, data_file = read_table(db, table)
-    count = len(rows)
-    write_table(cols, [], data_file)
+    with edit_table(db, table) as (cols, rows, _):
+        count = len(rows)
+        rows.clear()
     cprint(f"All {count} record(s) deleted from table '{table}'.")
-
 
 def delete_record_rows(db: str, args: list[str]) -> None:
     if len(args) < 2: raise ValueError("Usage: delete_record <table> <column> <value> OR delete_record <table> <record>")
     table = args[0]
-    cols, rows, data_file = read_table(db, table)
-    if len(args) >= 3 and args[1] in cols:
-        col, target = args[1], " ".join(args[2:])
-        idx = cols.index(col)
-        remaining = [row for row in rows if row[idx] != target]
-        removed = len(rows) - len(remaining)
-        if not removed: raise FileNotFoundError(f"Record not found in column '{col}'.")
-    else:
-        target = " ".join(args[1:])
-        remaining = [row for row in rows if " ".join(row) != target]
-        removed = len(rows) - len(remaining)
-        if not removed: raise FileNotFoundError(f"Record '{target}' not found.")
-    write_table(cols, remaining, data_file)
+    with edit_table(db, table) as (cols, rows, _):
+        if len(args) >= 3 and args[1] in cols:
+            col, target = args[1], " ".join(args[2:])
+            idx = cols.index(col)
+            remaining = [row for row in rows if row[idx] != target]
+            removed = len(rows) - len(remaining)
+            if not removed: raise FileNotFoundError(f"Record not found in column '{col}'.")
+        else:
+            target = " ".join(args[1:])
+            remaining = [row for row in rows if " ".join(row) != target and json.dumps(row, ensure_ascii=False) != target]
+            removed = len(rows) - len(remaining)
+            if not removed: raise FileNotFoundError(f"Record '{target}' not found.")
+        rows[:] = remaining
     cprint(f"{removed} record(s) deleted from table '{table}'.")
-
 
 def api_permissions_command(db: str, args: list[str]) -> None:
     d = ensure_db_layout(db)
@@ -2547,10 +2935,16 @@ def dispatch(db: str, command: str, raw_args: str) -> int:
         if command == "select_from":
             if db == "none": raise ValueError("No active database. Use 'use <name>' first.")
             select_tables(db, args); return 0
+        if command == "search":
+            if db == "none": raise ValueError("No active database. Use 'use <name>' first.")
+            search_table(db, args); return 0
+        if command == "index":
+            if db == "none": raise ValueError("No active database. Use 'use <name>' first.")
+            index_command(db, args); return 0
         if command == "insert_into":
             if db == "none": raise ValueError("No active database. Use 'use <name>' first.")
             groups = [part.strip() for part in raw_args.split("&") if part.strip()]
-            if not groups: raise ValueError("Usage: insert_into <table> <column> <value> [<column> <value> ...]")
+            if not groups: raise ValueError('Usage: insert_into <table> <column> "<value with spaces>" [<column> "<value>"]')
             for group in groups:
                 table_insert(db, parse_args(group))
             return 0
