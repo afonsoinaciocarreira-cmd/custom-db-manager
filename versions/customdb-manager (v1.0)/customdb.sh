@@ -241,11 +241,6 @@ done
 : <<'__DB_MANAGER_PYTHON_PAYLOAD__'
 #__DBM_PYTHON_BEGIN__
 #!/usr/bin/env python3
-"""Extension layer for the existing Custom DB Manager CLI.
-
-This module deliberately handles only the commands that need the requested fixes.
-All other commands continue to be handled by the original Bash CLI.
-"""
 from __future__ import annotations
 import contextlib
 import datetime as dt
@@ -260,7 +255,6 @@ import os
 import pathlib
 import pwd
 import re
-import readline
 import shlex
 import shutil
 import signal
@@ -2184,45 +2178,6 @@ def table_insert(db: str, args: list[str]) -> None:
     values_desc = ", ".join(f"{cols[i]}='{row[i]}'" for i in mapping)
     cprint(f"Table '{table}': appended record ID {row[0]} ({values_desc}).")
 
-def readline_main(db: str, host: str, output_file: str) -> None:
-    migrate_legacy_storage()
-    if db and db != "none" and (DB_ROOT / db).is_dir():
-        hist = DB_ROOT / db / ".cli_history"
-    else:
-        hist = ROOT / "runtime" / ".cli_history"
-    hist.parent.mkdir(parents=True, exist_ok=True)
-    try: readline.read_history_file(str(hist))
-    except (FileNotFoundError, OSError): pass
-    readline.set_history_length(10000)
-    prompt = f"\001{CYAN}\002{host}\001{RESET}\002@\001{CYAN}\002{db or 'none'}\001{RESET}\002 -> "
-    line = "exit"
-    # Keep readline's stdin/stdout attached to the real terminal even though the
-    # Bash caller captures the result through a temporary file.
-    try:
-        out = open(output_file, "w", encoding="utf-8")
-        if os.isatty(0) and os.path.exists("/dev/tty"):
-            tty_fd = os.open("/dev/tty", os.O_RDWR)
-            saved_in, saved_out = os.dup(0), os.dup(1)
-            try:
-                os.dup2(tty_fd, 0); os.dup2(tty_fd, 1)
-                line = input(prompt)
-            finally:
-                os.dup2(saved_in, 0); os.dup2(saved_out, 1)
-                os.close(saved_in); os.close(saved_out); os.close(tty_fd)
-        else:
-            sys.stderr.write(prompt); sys.stderr.flush()
-            line = sys.stdin.readline().rstrip("\n") or "exit"
-        if line.strip():
-            try: readline.write_history_file(str(hist))
-            except OSError: pass
-        out.write(line); out.close()
-    except EOFError:
-        with open(output_file, "w", encoding="utf-8") as out: out.write("exit")
-    except OSError:
-        with open(output_file, "w", encoding="utf-8") as out: out.write("exit")
-
-
-
 def table_paths(db: str, table: str) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
     d = ensure_db_layout(db)
     table = valid_name(table, "table name")
@@ -2502,7 +2457,6 @@ def read_table(db: str, table: str) -> tuple[list[str], list[list[str]], pathlib
         raise FileNotFoundError(f"Table '{table}' does not exist in database '{db}'.")
     with table_lock(folder):
         cols, rows, data_file = _read_table_unlocked(folder)
-        # Do not split, strip or normalize cell strings: spaces are data.
         rows = [[str(value) for value in row] for row in rows]
         return cols, rows, data_file
 
@@ -2732,8 +2686,6 @@ def select_tables(db: str, names: list[str]) -> None:
 def update_rows(db: str, args: list[str]) -> None:
     if len(args) != 4: raise ValueError('Usage: update <table> <column> "<value>" "<newvalue>"')
     table, col, old, new = args
-    # shlex-based CLI parsing keeps quoted values such as "New York" as one
-    # argument; clean both sides without trimming meaningful cell whitespace.
     old = clean_cell_value(old)
     new = clean_cell_value(new)
     with edit_table(db, table) as (cols, rows, _):
@@ -2798,7 +2750,6 @@ def dispatch(db: str, command: str, raw_args: str) -> int:
     command = command.strip()
     args = parse_args(raw_args)
     try:
-        # Database lifecycle: use stays with Bash so its CURRENT_DB prompt is updated.
         if command == "create_database":
             parts = [parse_args(part)[0] for part in raw_args.split("&") if parse_args(part)] if "&" in raw_args else args
             db_create(parts); return 0
@@ -2992,13 +2943,6 @@ def dispatch(db: str, command: str, raw_args: str) -> int:
     except Exception as exc:
         cprint(f"Error: {exc}", RED); return 0
     return 2
-
-
-def main() -> int:
-    if len(sys.argv) >= 2 and sys.argv[1] == "--readline":
-        readline_main(sys.argv[2] if len(sys.argv) > 2 else "none", sys.argv[3] if len(sys.argv) > 3 else "localhost",
-                      sys.argv[4] if len(sys.argv) > 4 else "/tmp/db-manager-line")
-        return 0
     if len(sys.argv) >= 2 and sys.argv[1] == "--serve":
         server_main(sys.argv[2], sys.argv[3]); return 0
     if len(sys.argv) >= 2 and sys.argv[1] == "--worker":
