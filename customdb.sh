@@ -46,7 +46,7 @@ shopt -s histappend 2>/dev/null || true
 
 # Internal clear command: never leave a blank terminal; redraw the startup banner.
 clear() {
-    if [ -t 1 ]; then printf '\033[2J\033[H'; fi
+    if [ -t 1 ]; then printf '\033[H\033[2J\033[3J'; fi
     printf '%b' "${CYAN}==================================================${NC}\n"
     printf '%b' "${BOLD}        CUSTOM DB MANAGER CLI - Version 1.0     ${NC}\n"
     printf '%b' "${CYAN}==================================================${NC}\n"
@@ -87,9 +87,9 @@ show_help() {
     printf '%b' "   ${CYAN}show_columns <table>${NC}              ${GRAY}- List columns${NC}\n"
     printf '%b' "   ${CYAN}rename_column <table> <old> <new>${NC} ${GRAY}- Rename a column${NC}\n\n"
     printf '%b' " ${YELLOW}[ ⚡ DATA OPERATIONS ]${NC}\n"
-    printf '%b' "   ${CYAN}insert_into <table> <column> "<value with spaces>"${NC} ${GRAY}- Append data (never overwrites existing rows)${NC}\n"
+    printf '%b' "   ${CYAN}insert_into <table> <column> \"<value with spaces>\"${NC} ${GRAY}- Append data (never overwrites existing rows)${NC}\n"
     printf '%b' "   ${CYAN}select_from <table>${NC}               ${GRAY}- Query data from a table${NC}\n"
-    printf '%b' "   ${CYAN}search <table> <column> "<value>"${NC} ${GRAY}- Search records using the optional index${NC}\n"
+    printf '%b' "   ${CYAN}search <table> <column> \"<value>\"${NC} ${GRAY}- Search records using the optional index${NC}\n"
     printf '%b' "   ${CYAN}index <table> <on|off|rebuild|status>${NC} ${GRAY}- Manage the table index${NC}\n"
     printf '%b' "   ${CYAN}update <table> <column> <old> <new>${NC} ${GRAY}- Update records${NC}\n"
     printf '%b' "   ${CYAN}delete_from <table>${NC}               ${GRAY}- Delete all records${NC}\n"
