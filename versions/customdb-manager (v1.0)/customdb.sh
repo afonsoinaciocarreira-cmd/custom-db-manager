@@ -2943,6 +2943,8 @@ def dispatch(db: str, command: str, raw_args: str) -> int:
     except Exception as exc:
         cprint(f"Error: {exc}", RED); return 0
     return 2
+    
+    def main() -> int:
     if len(sys.argv) >= 2 and sys.argv[1] == "--serve":
         server_main(sys.argv[2], sys.argv[3]); return 0
     if len(sys.argv) >= 2 and sys.argv[1] == "--worker":
