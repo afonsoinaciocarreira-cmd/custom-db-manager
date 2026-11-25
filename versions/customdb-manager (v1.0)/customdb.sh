@@ -1,3 +1,9 @@
+#!/usr/bin/env bash
+# ============================================================================
+# CUSTOM DB MANAGER CLI - Version 1.0 (single-file unified edition)
+# Bash CLI + embedded Python service layer. No external .py module is required.
+# ============================================================================
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -9,2654 +15,2609 @@ NC='\033[0m'
 
 CURRENT_DB="none"
 HOST=$(hostname 2>/dev/null || echo "localhost")
+SCRIPT_FILE=$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
 
-mkdir -p db_manage/database db_manage/secrets db_manage/backups
-[ -e "db_manage/secrets/secrets.env" ] || touch "db_manage/secrets/secrets.env"
-[ -e "db_manage/secrets/database.cfg" ] || touch "db_manage/secrets/database.cfg"
-[ -e "db_manage/secrets/api.cfg" ] || touch "db_manage/secrets/api.cfg"
-[ -e "db_manage/secrets/backup_configs.cfg" ] || touch "db_manage/secrets/backup_configs.cfg"
-[ -e "db_manage/secrets/backup_schedule.cfg" ] || touch "db_manage/secrets/backup_schedule.cfg"
+# Python code is embedded below this Bash program and extracted directly from
+# this same file. The delivered application is therefore one self-contained
+# .sh file; API and backup child processes relaunch this file as well.
+_dbm_python() {
+    DB_MANAGER_SCRIPT="$SCRIPT_FILE" python3 - "$@" < <(
+        sed -n '/^#__DBM_PYTHON_BEGIN__$/,/^#__DBM_PYTHON_END__$/p' "$SCRIPT_FILE" | sed '1d;$d'
+    )
+}
 
-show_banner() {
-    clear
+# Internal entry point used by API servers and independent backup workers.
+if [ "${1:-}" = "--db-manager-internal" ]; then
+    shift
+    _dbm_python "$@"
+    exit $?
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+    printf '%b\n' "${RED}Error: Python 3 is required to run Custom DB Manager.${NC}" >&2
+    exit 1
+fi
+
+mkdir -p db_manage/database db_manage/runtime
+set -o history
+HISTSIZE=100000
+HISTFILESIZE=100000
+shopt -s histappend 2>/dev/null || true
+
+# Internal clear command: never leave a blank terminal; redraw the startup banner.
+clear() {
+    if [ -t 1 ]; then printf '\033[2J\033[H'; fi
     printf '%b' "${CYAN}==================================================${NC}\n"
     printf '%b' "${BOLD}        CUSTOM DB MANAGER CLI - Version 1.0     ${NC}\n"
     printf '%b' "${CYAN}==================================================${NC}\n"
     printf '%b' " Type '${YELLOW}help${NC}' for commands or '${RED}exit${NC}' to quit.\n\n"
 }
 
-check_ip_port_in_use() {
-    chk_db="$1"
-    chk_type="$2"
-    chk_addr="$3"
-    chk_port="$4"
-    
-    [ -z "$chk_addr" ] && chk_addr="localhost"
-    [ -z "$chk_port" ] && chk_port="8080"
-    
-    if [ -d "db_manage/database" ]; then
-        for db_d in db_manage/database/*; do
-            [ -d "$db_d" ] || continue
-            other_db=$(basename "$db_d")
-            for api_t in public secret; do
-                if [ "$other_db" = "$chk_db" ] && [ "$api_t" = "$chk_type" ]; then
-                    continue
-                fi
-                cfg_f="$db_d/api/$api_t/api.cfg"
-                if [ -f "$cfg_f" ]; then
-                    e_addr=$(grep "^Address=" "$cfg_f" 2>/dev/null | cut -d'=' -f2 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                    e_port=$(grep "^Port=" "$cfg_f" 2>/dev/null | cut -d'=' -f2 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                    [ -z "$e_addr" ] && e_addr="localhost"
-                    [ -z "$e_port" ] && e_port="8080"
-                    
-                    if [ "$e_port" = "$chk_port" ]; then
-                        return 1
-                    fi
-                fi
-            done
-        done
-    fi
-    return 0
+show_banner() { clear; }
+
+show_help() {
+    printf '%b' "\n${CYAN}==================================================${NC}\n"
+    printf '%b' "${BOLD}            DATABASE COMMANDS (HELP)              ${NC}\n"
+    printf '%b' "${CYAN}==================================================${NC}\n\n"
+    printf '%b' " ${YELLOW}[ 🌐 API INTERACTION ]${NC}\n"
+    printf '%b' "   ${CYAN}api_status <public|secret>${NC}        ${GRAY}- Check API server status${NC}\n"
+    printf '%b' "   ${CYAN}api_start <public|secret>${NC}         ${GRAY}- Start API server${NC}\n"
+    printf '%b' "   ${CYAN}api_stop <public|secret> [--force]${NC} ${GRAY}- Stop API server${NC}\n"
+    printf '%b' "   ${CYAN}api_delete <public|secret>${NC}        ${GRAY}- Delete API files${NC}\n"
+    printf '%b' "   ${CYAN}api_request <public|secret> <cmd>${NC} ${GRAY}- Run CLI command via API${NC}\n"
+    printf '%b' "   ${CYAN}api_setup <public|secret>${NC}         ${GRAY}- Setup API configuration${NC}\n"
+    printf '%b' "   ${CYAN}api_edit <public|secret>${NC}          ${GRAY}- Edit API configuration${NC}\n"
+    printf '%b' "   ${CYAN}api_permissions <perm> <true|false>${NC} ${GRAY}- Manage public API permissions${NC}\n"
+    printf '%b' "   ${CYAN}api_key <add|remove|list> <key>${NC}   ${GRAY}- Manage database API keys${NC}\n\n"
+    printf '%b' " ${YELLOW}[ 📂 DATABASE MANAGEMENT ]${NC}\n"
+    printf '%b' "   ${CYAN}create_database <name>${NC}            ${GRAY}- Create a new database${NC}\n"
+    printf '%b' "   ${CYAN}drop_database <name>${NC}              ${GRAY}- Delete a database${NC}\n"
+    printf '%b' "   ${CYAN}rename_database <name> <newname>${NC}  ${GRAY}- Rename a database${NC}\n"
+    printf '%b' "   ${CYAN}use <name>${NC}                        ${GRAY}- Select active database${NC}\n"
+    printf '%b' "   ${CYAN}show_databases${NC}                    ${GRAY}- List all databases${NC}\n"
+    printf '%b' "   ${CYAN}describe <name>${NC}                   ${GRAY}- Show database metadata${NC}\n"
+    printf '%b' "   ${CYAN}dump_db${NC}                           ${GRAY}- Show full database dump${NC}\n\n"
+    printf '%b' " ${YELLOW}[ 🗄 TABLE MANAGEMENT ]${NC}\n"
+    printf '%b' "   ${CYAN}create_table <name>${NC}               ${GRAY}- Create a new table${NC}\n"
+    printf '%b' "   ${CYAN}drop_table <name>${NC}                 ${GRAY}- Delete a table${NC}\n"
+    printf '%b' "   ${CYAN}rename_table <name> <newname>${NC}     ${GRAY}- Rename a table${NC}\n"
+    printf '%b' "   ${CYAN}show_tables <table>${NC}               ${GRAY}- List tables or show a table${NC}\n"
+    printf '%b' "   ${CYAN}create_column <table> <column>${NC}    ${GRAY}- Add a column${NC}\n"
+    printf '%b' "   ${CYAN}drop_column <table> <column>${NC}      ${GRAY}- Delete a column${NC}\n"
+    printf '%b' "   ${CYAN}show_columns <table>${NC}              ${GRAY}- List columns${NC}\n"
+    printf '%b' "   ${CYAN}rename_column <table> <old> <new>${NC} ${GRAY}- Rename a column${NC}\n\n"
+    printf '%b' " ${YELLOW}[ ⚡ DATA OPERATIONS ]${NC}\n"
+    printf '%b' "   ${CYAN}insert_into <table> <column> <value>${NC} ${GRAY}- Insert data${NC}\n"
+    printf '%b' "   ${CYAN}select_from <table>${NC}               ${GRAY}- Query data from a table${NC}\n"
+    printf '%b' "   ${CYAN}update <table> <column> <old> <new>${NC} ${GRAY}- Update records${NC}\n"
+    printf '%b' "   ${CYAN}delete_from <table>${NC}               ${GRAY}- Delete all records${NC}\n"
+    printf '%b' "   ${CYAN}delete_record <table> <column> <val>${NC} ${GRAY}- Delete a record${NC}\n\n"
+    printf '%b' " ${YELLOW}[ 📦 BACKUP MANAGEMENT ]${NC}\n"
+    printf '%b' "   ${CYAN}backup <name> [--force]${NC}           ${GRAY}- Create a database-only backup${NC}\n"
+    printf '%b' "   ${CYAN}backups${NC}                           ${GRAY}- List backups${NC}\n"
+    printf '%b' "   ${CYAN}backup_restore <name> [--force]${NC}   ${GRAY}- Restore a backup${NC}\n"
+    printf '%b' "   ${CYAN}backup_delete <name> [--force]${NC}    ${GRAY}- Delete a backup${NC}\n"
+    printf '%b' "   ${CYAN}backup_schedule <func> <true|false> <interval>${NC} ${GRAY}- Schedule backup functions${NC}\n"
+    printf '%b' "   ${CYAN}backup_configs <key> <value>${NC}      ${GRAY}- Show/configure backup features, including backup_storage_path${NC}\n\n"
+    printf '%b' " ${YELLOW}[ 🛠 SYSTEM ]${NC}\n"
+    printf '%b' "   ${CYAN}system_terminate [--force]${NC}        ${GRAY}- Stop processes and reset db_manage${NC}\n"
+    printf '%b' "   ${CYAN}system_process${NC}                    ${GRAY}- List managed processes${NC}\n"
+    printf '%b' "   ${CYAN}system_process <kill> <database|public|secret|backup|backup_delete|pid>${NC} ${GRAY}- Terminate a managed process${NC}\n"
+    printf '%b' "   ${CYAN}clear${NC}                             ${GRAY}- Clear screen${NC}\n"
+    printf '%b' "   ${CYAN}help${NC}                              ${GRAY}- Show this help menu${NC}\n"
+    printf '%b' "   ${CYAN}exit / quit${NC}                       ${GRAY}- Exit application${NC}\n\n"
+    printf '%b' "${CYAN}==================================================${NC}\n\n"
 }
 
-generate_server_script() {
-    server_script="$1"
-    cat << 'EOF' > "$server_script"
-import http.server
-import json
-import os
-import urllib.parse
-import ssl
-import time
-from collections import defaultdict
-
-PORT = int(os.environ.get("API_PORT", 8080))
-SECRET_KEY = os.environ.get("API_SECRET", "default_secret")
-DB_NAME = os.environ.get("DB_NAME", "db")
-PROTOCOL = os.environ.get("API_PROTOCOL", "http")
-API_TYPE = os.environ.get("API_TYPE", "public")
-API_DEBUG = os.environ.get("API_DEBUG", "true").lower() == "true"
-CERT_FILE = os.environ.get("API_CERT", "")
-KEY_FILE = os.environ.get("API_KEY", "")
-
-DB_BASE_DIR = os.path.join("db_manage", "database")
-DB_PATH = os.path.join(DB_BASE_DIR, DB_NAME)
-TABLES_DIR = os.path.join(DB_PATH, "tables")
-API_DIR = os.path.join(DB_PATH, "api", API_TYPE)
-PERM_FILE = os.path.join(API_DIR, "permissions.cfg")
-
-REQUEST_TIMESTAMPS = defaultdict(list)
-
-class DBAPIHandler(http.server.BaseHTTPRequestHandler):
-    def _check_auth(self):
-        client_key = self.headers.get("X-Secret-Key")
-        parsed_path = urllib.parse.urlparse(self.path)
-        query_params = urllib.parse.parse_qs(parsed_path.query)
-        query_key = query_params.get("key", [None])[0]
-        
-        if client_key == SECRET_KEY or query_key == SECRET_KEY:
-            return True
-        return False
-
-    def _check_permission(self, perm_name):
-        if API_TYPE == "secret":
-            return True
-        if not os.path.exists(PERM_FILE):
-            return False
-        with open(PERM_FILE, "r") as f:
-            for line in f:
-                parts = line.strip().split("=")
-                if len(parts) == 2 and parts[0] == perm_name:
-                    return parts[1].lower() == "true"
-        return False
-
-    def do_GET(self):
-        self._handle_request("GET")
-
-    def do_POST(self):
-        self._handle_request("POST")
-
-    def do_PUT(self):
-        self._handle_request("PUT")
-
-    def do_DELETE(self):
-        self._handle_request("DELETE")
-
-    def _handle_request(self, method):
-        if API_TYPE == "public":
-            client_ip = self.client_address[0]
-            current_time = time.time()
-            REQUEST_TIMESTAMPS[client_ip] = [t for t in REQUEST_TIMESTAMPS[client_ip] if current_time - t < 5.0]
-            if len(REQUEST_TIMESTAMPS[client_ip]) >= 10:
-                err_data = {
-                    "status": "error",
-                    "database": DB_NAME,
-                    "endpoint": urllib.parse.urlparse(self.path).path,
-                    "error": "Rate limit exceeded."
-                }
-                if API_DEBUG:
-                    err_data["api_type"] = API_TYPE
-                self._send_response(429, err_data)
-                return
-            REQUEST_TIMESTAMPS[client_ip].append(current_time)
-
-        if not self._check_auth():
-            err_data = {"status": "error", "error": "Unauthorized"}
-            self._send_response(401, err_data)
-            return
-
-        parsed_path = urllib.parse.urlparse(self.path)
-        path = parsed_path.path
-        query_params = {k: v[0] if len(v) == 1 else v for k, v in urllib.parse.parse_qs(parsed_path.query).items()}
-
-        body_data = {}
-        if method in ["POST", "PUT", "PATCH"]:
-            content_length = int(self.headers.get('Content-Length', 0))
-            if content_length > 0:
-                body_bytes = self.rfile.read(content_length)
-                try:
-                    body_data = json.loads(body_bytes.decode('utf-8'))
-                except Exception:
-                    body_data = {"raw_body": body_bytes.decode('utf-8', errors='ignore')}
-
-        params = {**query_params, **body_data}
-        response_data = {"status": "success", "database": DB_NAME, "method": method, "endpoint": path, "protocol": PROTOCOL}
-        if API_DEBUG:
-            response_data["api_type"] = API_TYPE
-        status_code = 200
-
-        try:
-            os.makedirs(TABLES_DIR, exist_ok=True)
-
-            if path.startswith("/api_") or path in ["/show_databases", "/create_database", "/drop_database", "/use"] or path.startswith("/create_database/") or path.startswith("/drop_database/"):
-                status_code = 403
-                raise ValueError(f"Error: API restriction - Endpoint '{path}' is strictly prohibited.")
-
-            if path in ["/", "/status"]:
-                tables = [d for d in os.listdir(TABLES_DIR) if os.path.isdir(os.path.join(TABLES_DIR, d))] if os.path.exists(TABLES_DIR) else []
-                response_data.update({
-                    "message": "Database API running successfully!",
-                    "tables": tables
-                })
-                accept_header = self.headers.get("Accept", "")
-                if "text/html" in accept_header or path == "/":
-                    self._send_html_response(status_code, response_data)
-                    return
-
-            elif path == "/dump_db":
-                if not self._check_permission("dump_db"):
-                    status_code = 403
-                    raise ValueError("Error: Permission denied for 'dump_db'.")
-                metadata = ""
-                db_file = os.path.join(DB_PATH, f"{DB_NAME}.db")
-                if os.path.exists(db_file):
-                    with open(db_file, "r") as f:
-                        metadata = f.read()
-                tables = [d for d in os.listdir(TABLES_DIR) if os.path.isdir(os.path.join(TABLES_DIR, d))] if os.path.exists(TABLES_DIR) else []
-                response_data.update({
-                    "message": f"Universal database dump for '{DB_NAME}'.",
-                    "metadata": json.loads(metadata) if metadata.startswith("{") else metadata,
-                    "tables": tables
-                })
-
-            elif path == "/show_tables":
-                if not self._check_permission("show_tables"):
-                    status_code = 403
-                    raise ValueError("Error: Permission denied for 'show_tables'.")
-                tables = [d for d in os.listdir(TABLES_DIR) if os.path.isdir(os.path.join(TABLES_DIR, d))] if os.path.exists(TABLES_DIR) else []
-                response_data["tables"] = tables
-
-            elif path.startswith("/select_from/") or path.startswith("/select/"):
-                if not self._check_permission("select_from"):
-                    status_code = 403
-                    raise ValueError("Error: Permission denied for 'select_from'.")
-                tbl_name = path.split("/")[-1]
-                tbl_dir = os.path.join(TABLES_DIR, tbl_name)
-                data_file = os.path.join(tbl_dir, "tables")
-                if not os.path.exists(tbl_dir) or not os.path.exists(data_file):
-                    status_code = 404
-                    raise ValueError(f"Error: Table '{tbl_name}' does not exist.")
-                with open(data_file, "r") as f:
-                    records = [line.replace("\r", "").strip() for line in f if line.strip()]
-                response_data["table"] = tbl_name
-                response_data["records"] = records
-
-            elif path.startswith("/insert_into/") or path.startswith("/insert/"):
-                if not self._check_permission("insert_into"):
-                    status_code = 403
-                    raise ValueError("Error: Permission denied for 'insert_into'.")
-                tbl_name = path.split("/")[-1]
-                tbl_dir = os.path.join(TABLES_DIR, tbl_name)
-                cols_file = os.path.join(tbl_dir, "columns")
-                data_file = os.path.join(tbl_dir, "tables")
-                if not os.path.exists(tbl_dir) or not os.path.exists(cols_file):
-                    status_code = 404
-                    raise ValueError(f"Error: Table '{tbl_name}' does not exist.")
-                
-                data_to_insert = params.get("data") or params.get("record") or body_data.get("raw_body")
-                if not data_to_insert:
-                    status_code = 400
-                    raise ValueError("Error: Missing data to insert.")
-                
-                with open(cols_file, "r") as f:
-                    header = [c.replace("\r", "").strip() for c in f if c.strip()]
-                if not header:
-                    header = ["id"]
-                num_cols = len(header)
-                
-                lines = []
-                if os.path.exists(data_file):
-                    with open(data_file, "r") as f:
-                        lines = [line.replace("\r", "").strip() for line in f if line.strip()]
-                
-                rows = []
-                for line in lines:
-                    parts = [p.strip().replace("\n", " ").replace("\r", "") for p in line.split(" ")]
-                    while len(parts) < num_cols:
-                        parts.append("")
-                    rows.append(parts[:num_cols])
-                
-                target_map = {}
-                if isinstance(data_to_insert, dict):
-                    for k, v in data_to_insert.items():
-                        if k in header and k != "id":
-                            target_map[header.index(k)] = str(v).replace("\n", " ").replace("\r", "")
-                else:
-                    raw_str = str(data_to_insert).replace("\n", " ").replace("\r", "")
-                    parts = [p.strip() for p in raw_str.replace("|", " ").split(" ") if p.strip()]
-                    if parts and parts[0] in header:
-                        i = 0
-                        while i < len(parts) - 1:
-                            col = parts[i]
-                            val = parts[i+1]
-                            if col in header and col != "id":
-                                target_map[header.index(col)] = val
-                                i += 2
-                            else:
-                                i += 1
-                    else:
-                        start_idx = 1 if (header and header[0] == "id") else 0
-                        for idx, p in enumerate(parts):
-                            c_idx = start_idx + idx
-                            if c_idx < num_cols:
-                                target_map[c_idx] = p
-
-                target_row_idx = -1
-                if target_map:
-                    for r_idx, r in enumerate(rows):
-                        is_empty = True
-                        for c_idx in target_map:
-                            if r[c_idx] != "":
-                                is_empty = False
-                                break
-                        if is_empty:
-                            target_row_idx = r_idx
-                            break
-
-                if target_row_idx != -1:
-                    for c_idx, val in target_map.items():
-                        rows[target_row_idx][c_idx] = val
-                    inserted_row = rows[target_row_idx]
-                else:
-                    new_row = [""] * num_cols
-                    if header and header[0] == "id":
-                        new_row[0] = str(len(rows) + 1)
-                    for c_idx, val in target_map.items():
-                        new_row[c_idx] = val
-                    rows.append(new_row)
-                    inserted_row = new_row
-
-                with open(data_file, "w") as f:
-                    for r in rows:
-                        f.write(" ".join(r) + "\n")
-
-                new_row_str = " ".join(inserted_row)
-                response_data["message"] = f"Data successfully inserted into table '{tbl_name}'."
-                response_data["inserted_data"] = new_row_str
-
-            elif path.startswith("/create_table/"):
-                if not self._check_permission("create_table"):
-                    status_code = 403
-                    raise ValueError("Error: Permission denied for 'create_table'.")
-                tbl_name = path.split("/")[-1]
-                if not tbl_name or tbl_name == "create_table":
-                    status_code = 400
-                    raise ValueError("Error: Table name is required.")
-                tbl_dir = os.path.join(TABLES_DIR, tbl_name)
-                if os.path.exists(tbl_dir):
-                    status_code = 409
-                    raise ValueError(f"Error: Table '{tbl_name}' already exists.")
-                os.makedirs(tbl_dir, exist_ok=True)
-                with open(os.path.join(tbl_dir, "columns"), "w") as f:
-                    f.write("id\n")
-                open(os.path.join(tbl_dir, "tables"), "w").close()
-                response_data["message"] = f"Table '{tbl_name}' created successfully."
-
-            elif path.startswith("/drop_table/"):
-                if not self._check_permission("drop_table"):
-                    status_code = 403
-                    raise ValueError("Error: Permission denied for 'drop_table'.")
-                tbl_name = path.split("/")[-1]
-                tbl_dir = os.path.join(TABLES_DIR, tbl_name)
-                if not os.path.exists(tbl_dir):
-                    status_code = 404
-                    raise ValueError(f"Error: Table '{tbl_name}' does not exist.")
-                import shutil
-                shutil.rmtree(tbl_dir)
-                response_data["message"] = f"Table '{tbl_name}' dropped successfully."
-
-            elif path.startswith("/delete_from/"):
-                if not self._check_permission("delete_from"):
-                    status_code = 403
-                    raise ValueError("Error: Permission denied for 'delete_from'.")
-                tbl_name = path.split("/")[-1]
-                tbl_dir = os.path.join(TABLES_DIR, tbl_name)
-                data_file = os.path.join(tbl_dir, "tables")
-                if not os.path.exists(tbl_dir):
-                    status_code = 404
-                    raise ValueError(f"Error: Table '{tbl_name}' does not exist.")
-                open(data_file, "w").close()
-                response_data["message"] = f"All records deleted from table '{tbl_name}'."
-
-            elif path.startswith("/delete_record/"):
-                if not self._check_permission("delete_record"):
-                    status_code = 403
-                    raise ValueError("Error: Permission denied for 'delete_record'.")
-                parts = path.strip("/").split("/")
-                if len(parts) < 3:
-                    status_code = 400
-                    raise ValueError("Error: Usage format /delete_record/<table_name>/<value>")
-                tbl_name = parts[1]
-                target_val = urllib.parse.unquote("/".join(parts[2:]))
-                tbl_dir = os.path.join(TABLES_DIR, tbl_name)
-                data_file = os.path.join(tbl_dir, "tables")
-                if not os.path.exists(tbl_dir):
-                    status_code = 404
-                    raise ValueError(f"Error: Table '{tbl_name}' does not exist.")
-                
-                tmp_file = data_file + ".tmp"
-                found = False
-                with open(data_file, "r") as f_in, open(tmp_file, "w") as f_out:
-                    for line in f_in:
-                        clean_line = line.replace("\r", "").strip()
-                        if clean_line == target_val:
-                            found = True
-                        else:
-                            f_out.write(line.replace("\r", ""))
-                os.replace(tmp_file, data_file)
-                
-                if found:
-                    response_data["message"] = f"Record deleted from table '{tbl_name}'."
-                else:
-                    status_code = 404
-                    raise ValueError(f"Error: Record not found in table '{tbl_name}'.")
-
-            else:
-                response_data["message"] = f"Endpoint '{path}' reached and executed successfully."
-
-        except Exception as e:
-            if status_code == 200:
-                status_code = 400
-            response_data = {
-                "status": "error",
-                "database": DB_NAME,
-                "endpoint": path,
-                "error": str(e)
-            }
-            if API_DEBUG:
-                response_data["api_type"] = API_TYPE
-
-        self._send_response(status_code, response_data)
-
-    def _send_response(self, code, data):
-        if isinstance(data, dict):
-            if API_DEBUG:
-                if "message" in data:
-                    data["message"] = f"{data['message']} - Powered by Afonso Carreira.Inc"
-                else:
-                    data["message"] = "Powered by Afonso Carreira.Inc"
-            else:
-                if "api_type" in data:
-                    del data["api_type"]
-        body = json.dumps(data, indent=2).encode('utf-8')
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _send_html_response(self, code, data):
-        footer_html = '<div class="footer">Powered by Afonso Carreira.Inc</div>' if API_DEBUG else ''
-        api_type_html = f'<p><strong>API Type:</strong> <code>{API_TYPE.upper()}</code></p>' if API_DEBUG else ''
-        html_content = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>Database API Dashboard</title>
-    <style>
-        body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 30px; }}
-        .container {{ max-width: 850px; margin: 0 auto; background: #1e293b; padding: 40px; border-radius: 12px; box-shadow: 0 8px 30px rgba(0,0,0,0.6); border: 1px solid #334155; }}
-        h1 {{ color: #38bdf8; border-bottom: 2px solid #334155; padding-bottom: 12px; margin-top: 0; display: flex; justify-content: space-between; align-items: center; }}
-        pre {{ background: #0f172a; padding: 20px; border-radius: 8px; overflow-x: auto; color: #38bdf8; border: 1px solid #334155; font-size: 14px; }}
-        ul {{ list-style-type: none; padding: 0; }}
-        li {{ background: #334155; margin: 8px 0; padding: 12px 16px; border-radius: 6px; display: flex; align-items: center; font-weight: 500; }}
-        .status-box {{ background: #064e3b; border: 1px solid #059669; color: #34d399; padding: 12px 16px; border-radius: 6px; margin-bottom: 20px; font-weight: 600; }}
-        .footer {{ margin-top: 20px; text-align: cesnter; color: #38bdf8; font-weight: bold; }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Database Server Dashboard <span>{DB_NAME}</span></h1>
-        <div class="status-box">✓ Database API running successfully!</div>
-        {api_type_html}
-        <p><strong>Protocol:</strong> <code>{PROTOCOL.upper()}</code></p>
-        <h3>Active Database Tables:</h3>
-        <ul>
-            {"".join([f"<li>📁 &nbsp; {t}</li>" for t in data.get('tables', [])]) if data.get('tables') else "<li>(No tables found)</li>"}
-        </ul>
-        <h3>Output (JSON):</h3>
-        <pre>{json.dumps(data, indent=2)}</pre>
-        {footer_html}
-    </div>
-</body>
-</html>
-"""
-        body = html_content.encode('utf-8')
-        self.send_response(code)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, format, *args):
-        pass
-
-if __name__ == "__main__":
-    server = http.server.HTTPServer(("0.0.0.0", PORT), DBAPIHandler)
-    if PROTOCOL.lower() == "https" and CERT_FILE and KEY_FILE:
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        context.load_cert_chain(certfile=CERT_FILE, keyfile=KEY_FILE)
-        server.socket = context.wrap_socket(server.socket, server_side=True)
-    server.serve_forever()
-EOF
-}
-
-generate_backup_server_script() {
-    backup_server_script="$1"
-    cat << 'EOF' > "$backup_server_script"
-import os
-import time
-import subprocess
-import sys
-import glob
-
-FUNC_NAME = sys.argv[1] if len(sys.argv) > 1 else "backup"
-INTERVAL = float(sys.argv[2]) if len(sys.argv) > 2 else 300
-LOG_FILE = os.path.join("db_manage", "secrets", "backup_schedule.log")
-
-while True:
-    time.sleep(INTERVAL)
-    timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
-    os.makedirs("db_manage/backups", exist_ok=True)
-    if FUNC_NAME == "backup":
-        bname = f"auto-{timestamp}"
-        subprocess.run(["tar", "-czf", f"db_manage/backups/{bname}.tar.gz", "db_manage"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    elif FUNC_NAME == "backup_delete":
-        config_file = os.path.join("db_manage", "secrets", "backup_configs.cfg")
-        max_backups = 10
-        if os.path.exists(config_file):
-            try:
-                with open(config_file, "r") as cf:
-                    in_retention = False
-                    for line in cf:
-                        line = line.strip()
-                        if line == "[Retention]":
-                            in_retention = True
-                            continue
-                        elif line.startswith("[") and line.endswith("]"):
-                            in_retention = False
-                        if in_retention and line.startswith("max_backups="):
-                            max_backups = int(line.split("=")[1].strip())
-            except Exception:
-                pass
-        backup_files = sorted(glob.glob(os.path.join("db_manage", "backups", "*.tar.gz")), key=os.path.getmtime)
-        while len(backup_files) > max_backups:
-            oldest = backup_files.pop(0)
-            try:
-                os.remove(oldest)
-            except Exception:
-                pass
-    with open(LOG_FILE, "a") as f:
-        f.write(f"{time.ctime()}: Automated backup function '{FUNC_NAME}' executed successfully (PID: {os.getpid()})\n")
-EOF
-}
-
-init_permissions_file() {
-    perm_file="$1"
-    if [ ! -f "$perm_file" ]; then
-        cat << EOF > "$perm_file"
-show_tables=false
-dump_db=false
-select_from=false
-insert_into=false
-create_table=false
-drop_table=false
-delete_from=false
-delete_record=false
-create_column=false
-drop_column=false
-show_columns=false
-rename_column=false
-update=false
-rename_table=false
-EOF
-    fi
-}
-
-init_backup_configs_file() {
-    cfg_file="$1"
-    if [ ! -f "$cfg_file" ] || [ ! -s "$cfg_file" ]; then
-        cat << EOF > "$cfg_file"
-[General]
-default_backup_name=auto
-auto_compression=true
-verify_integrity=false
-[Retention]
-max_backups=10
-auto_cleanup=false
-keep_daily=false
-keep_weekly=false
-[Schedule]
-default_interval=1h
-background_daemon=true
-notify_on_completion=false
-[Security]
-encrypt_backups=false
-storage_permissions=700
-sign_manifest=false
-EOF
-    fi
-}
-
-init_backup_configs_file "db_manage/secrets/backup_configs.cfg"
-
-init_backup_schedule_file() {
-    s_file="$1"
-    if [ ! -f "$s_file" ] || [ ! -s "$s_file" ]; then
-        cat << EOF > "$s_file"
-backup=false:1h
-backup_delete=false:1d
-EOF
-    fi
-}
-
-init_backup_schedule_file "db_manage/secrets/backup_schedule.cfg"
-
-parse_interval() {
-    val="$1"
-    num=$(echo "$val" | sed 's/[^0-9]*//g')
-    unit=$(echo "$val" | sed 's/[0-9]*//g')
-    [ -z "$num" ] && num="300"
-    case "$unit" in
-        sec) secs="$num" ;;
-        min) secs=$(expr "$num" \* 60) ;;
-        h) secs=$(expr "$num" \* 3600) ;;
-        d) secs=$(expr "$num" \* 86400) ;;
-        w) secs=$(expr "$num" \* 604800) ;;
-        y) secs=$(expr "$num" \* 31536000) ;;
-        *) secs="$num" ;;
-    esac
-    echo "$secs"
-}
-
-print_professional_table() {
-    tbl_dir="$1"
-    python3 -c '
-import sys, os
-tbl_dir = sys.argv[1]
-cols_file = os.path.join(tbl_dir, "columns")
-data_file = os.path.join(tbl_dir, "tables")
-if not os.path.exists(cols_file):
-    print("Error: Table columns not found.")
-    sys.exit(1)
-with open(cols_file, "r") as f:
-    header = [c.replace("\r", "").strip().replace("\n", " ") for c in f if c.strip()]
-if not header:
-    header = ["id"]
-rows_data = []
-if os.path.exists(data_file):
-    with open(data_file, "r") as f:
-        rows_data = [line.replace("\r", "").strip() for line in f if line.strip()]
-
-num_cols = len(header)
-rows = [header]
-for line in rows_data:
-    r = [c.strip().replace("\n", " ").replace("\r", "") for c in line.split(" ")]
-    while len(r) < num_cols:
-        r.append("")
-    rows.append(r[:num_cols])
-
-if len(rows) == 1:
-    rows.append(["" for _ in range(num_cols)])
-
-col_widths = [max(len(row[i]) for row in rows) for i in range(num_cols)]
-col_widths = [max(w, 4) for w in col_widths]
-def print_row(row, widths, is_header=False):
-    formatted = []
-    for i, val in enumerate(row):
-        if is_header:
-            padded = val.center(widths[i])
-            cell_str = f"\033[1;32m{padded}\033[0m"
-        else:
-            padded = val.center(widths[i])
-            cell_str = padded
-        formatted.append(cell_str)
-    return "│ " + " │ ".join(formatted) + " │"
-def print_separator(widths, left, mid, right, fill):
-    return left + fill.join(fill * (w + 2) for w in widths) + right
-print(print_separator(col_widths, "┌", "┬", "┐", "─"))
-print(print_row(rows[0], col_widths, is_header=True))
-print(print_separator(col_widths, "├", "┼", "┤", "─"))
-data_rows = rows[1:]
-for idx, row in enumerate(data_rows):
-    print(print_row(row, col_widths, is_header=False))
-    if idx < len(data_rows) - 1:
-        print(print_separator(col_widths, "├", "┼", "┤", "─"))
-    else:
-        print(print_separator(col_widths, "└", "┴", "┘", "─"))
-' "$tbl_dir"
-}
-
-print_professional_columns() {
-    tbl_dir="$1"
-    python3 -c '
-import sys, os
-tbl_dir = sys.argv[1]
-cols_file = os.path.join(tbl_dir, "columns")
-if not os.path.exists(cols_file):
-    print("  (No columns found)")
-    sys.exit(0)
-with open(cols_file, "r") as f:
-    cols = [c.replace("\r", "").strip() for c in f if c.strip()]
-if not cols:
-    print("  (No columns found)")
-    sys.exit(0)
-max_len = max(len(c) for c in cols)
-max_len = max(max_len, 15)
-title_plain = "COLUMNS"
-title_colored = f"\033[1;36m{title_plain:<{max_len}}\033[0m"
-print("┌" + "─" * (max_len + 4) + "┐")
-print(f"│ {title_colored} │")
-print("├" + "─" * (max_len + 4) + "┤")
-for c in cols:
-    c_padded = f"{c:<{max_len}}"
-    print(f"│ {c_padded} │")
-print("└" + "─" * (max_len + 4) + "┘")
-' "$tbl_dir"
-}
-
-confirm_action() {
-    force_flag="$1"
-    action_desc="$2"
-    if [ "$force_flag" = "--force" ]; then
-        return 0
-    fi
-    printf '%b' "${YELLOW}Warning: $action_desc. Do you want to proceed? (yes/no): ${NC}"
-    read -r ans
-    if [ "$ans" = "yes" ]; then
-        return 0
+history_file_for_db() {
+    if [ "$CURRENT_DB" = "none" ]; then
+        printf '%s' "db_manage/runtime/.cli_history"
     else
-        printf '%b' "${RED}Action cancelled.${NC}\n"
-        return 1
+        printf '%s' "db_manage/database/$CURRENT_DB/.cli_history"
     fi
+}
+
+load_database_history() {
+    local hf
+    hf=$(history_file_for_db)
+    mkdir -p "$(dirname "$hf")"
+    history -c
+    [ -f "$hf" ] && history -r "$hf"
+    HISTFILE="/dev/null"
+}
+
+save_database_history() {
+    local hf
+    hf=$(history_file_for_db)
+    mkdir -p "$(dirname "$hf")"
+    local last_entry
+    last_entry=$(HISTTIMEFORMAT= history 1 2>/dev/null | sed -E 's/^[[:space:]]*[0-9]+[[:space:]]*//')
+    [ "$last_entry" = "$1" ] || history -s "$1"
+    printf '%s\n' "$1" >> "$hf"
+    chmod 600 "$hf" 2>/dev/null || true
+}
+
+trim_text() {
+    local v="$1"
+    v="${v#"${v%%[![:space:]]*}"}"
+    v="${v%"${v##*[![:space:]]}"}"
+    printf '%s' "$v"
 }
 
 show_banner
+load_database_history
 
 while true; do
-    printf '%b' "${CYAN}$HOST${NC}@${BLUE}$CURRENT_DB${NC} -> "
-    read -r line
-    line_trim=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-    [ -z "$line_trim" ] && continue
+    line=""
+    if ! IFS= read -e -r -p "$(printf '%b' "${CYAN}${HOST}${NC}@${BLUE}${CURRENT_DB}${NC} -> ")" line; then
+        printf '%b\n' "${GREEN}Exiting. Goodbye!${NC}"
+        exit 0
+    fi
+    line=$(trim_text "$line")
+    [ -z "$line" ] && continue
+    save_database_history "$line"
 
     OLD_IFS="$IFS"
-    IFS='|'
-    set -- $line
+    IFS='|' read -r -a command_items <<< "$line"
     IFS="$OLD_IFS"
 
-    for cmd_item in "$@"; do
-        cmd_item=$(echo "$cmd_item" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    for cmd_item in "${command_items[@]}"; do
+        cmd_item=$(trim_text "$cmd_item")
         [ -z "$cmd_item" ] && continue
-
-        set -- $cmd_item
-        command="$1"
-        shift
-        args="$*"
+        command="${cmd_item%%[[:space:]]*}"
+        if [ "$command" = "$cmd_item" ]; then
+            args=""
+        else
+            args="${cmd_item#"$command"}"
+            args=$(trim_text "$args")
+        fi
 
         case "$command" in
-            "exit" | "quit")
-                printf '%b' "${GREEN}Exiting. Goodbye!${NC}\n"
+            exit|quit)
+                printf '%b\n' "${GREEN}Exiting. Goodbye!${NC}"
                 exit 0
                 ;;
-            "help")
-                printf '%b' "\n${CYAN}==================================================${NC}\n"
-                printf '%b' "${BOLD}            DATABASE COMMANDS (HELP)              ${NC}\n"
-                printf '%b' "${CYAN}==================================================${NC}\n\n"
-                printf '%b' " ${YELLOW}[ 🌐 API INTERACTION ]${NC}\n"
-                printf '%b' "   ${CYAN}api_status <public|secret>${NC}        ${GRAY}- Check API server status${NC}\n"
-                printf '%b' "   ${CYAN}api_start <public|secret>${NC}         ${GRAY}- Start API server${NC}\n"
-                printf '%b' "   ${CYAN}api_stop <public|secret> [--force]${NC} ${GRAY}- Stop API server${NC}\n"
-                printf '%b' "   ${CYAN}api_delete <public|secret>${NC}        ${GRAY}- Delete API files${NC}\n"
-                printf '%b' "   ${CYAN}api_request <public|secret> <cmd>${NC} ${GRAY}- Run CLI command via API${NC}\n"
-                printf '%b' "   ${CYAN}api_setup <public|secret>${NC}         ${GRAY}- Setup API configuration${NC}\n"
-                printf '%b' "   ${CYAN}api_edit <public|secret>${NC}          ${GRAY}- Edit API configuration${NC}\n"
-                printf '%b' "   ${CYAN}api_permissions <perm> <true|false>${NC} ${GRAY}- Manage permissions${NC}\n"
-                printf '%b' "   ${CYAN}api_key_list${NC}                      ${GRAY}- List API secret keys${NC}\n"
-                printf '%b' "   ${CYAN}api_key_add <key>${NC}                 ${GRAY}- Add a secret key${NC}\n"
-                printf '%b' "   ${CYAN}api_key_remove <key>${NC}              ${GRAY}- Remove a secret key${NC}\n\n"
-                printf '%b' " ${YELLOW}[ 📂 DATABASE MANAGEMENT ]${NC}\n"
-                printf '%b' "   ${CYAN}create_database <name>${NC}            ${GRAY}- Create a new database${NC}\n"
-                printf '%b' "   ${CYAN}drop_database <name>${NC}              ${GRAY}- Delete a database${NC}\n"
-                printf '%b' "   ${CYAN}rename_database <name> <newname>${NC}  ${GRAY}- Rename a database${NC}\n"
-                printf '%b' "   ${CYAN}use <name>${NC}                        ${GRAY}- Select active database${NC}\n"
-                printf '%b' "   ${CYAN}show_databases${NC}                    ${GRAY}- List all databases${NC}\n"
-                printf '%b' "   ${CYAN}describe <name>${NC}                   ${GRAY}- Show database structure${NC}\n"
-                printf '%b' "   ${CYAN}dump_db${NC}                           ${GRAY}- Show full DB dump${NC}\n\n"
-                printf '%b' " ${YELLOW}[ 🗄 TABLE MANAGEMENT ]${NC}\n"
-                printf '%b' "   ${CYAN}create_table <name>${NC}               ${GRAY}- Create a new table${NC}\n"
-                printf '%b' "   ${CYAN}drop_table <name>${NC}                 ${GRAY}- Delete a table${NC}\n"
-                printf '%b' "   ${CYAN}rename_table <name> <newname>${NC}     ${GRAY}- Rename a table${NC}\n"
-                printf '%b' "   ${CYAN}show_tables <tbl>${NC}                 ${GRAY}- List tables or show specific table${NC}\n"
-                printf '%b' "   ${CYAN}create_column <tbl> <col>${NC}         ${GRAY}- Add a column${NC}\n"
-                printf '%b' "   ${CYAN}drop_column <tbl> <col>${NC}           ${GRAY}- Delete a column${NC}\n"
-                printf '%b' "   ${CYAN}show_columns <tbl>${NC}                ${GRAY}- List columns in a table${NC}\n"
-                printf '%b' "   ${CYAN}rename_column <tbl> <col> <newcol>${NC} ${GRAY}- Rename a column${NC}\n\n"
-                printf '%b' " ${YELLOW}[ ⚡ DATA OPERATIONS ]${NC}\n"
-                printf '%b' "   ${CYAN}insert_into <tbl> <col> <data>${NC}  ${GRAY}- Insert data (row or column)${NC}\n"
-                printf '%b' "   ${CYAN}select_from <tbl>${NC}                 ${GRAY}- Query data from a table${NC}\n"
-                printf '%b' "   ${CYAN}update <tbl> <col> <val> <newval>${NC} ${GRAY}- Update records${NC}\n"
-                printf '%b' "   ${CYAN}delete_from <tbl>${NC}                 ${GRAY}- Delete all records${NC}\n"
-                printf '%b' "   ${CYAN}delete_record <tbl> <col> <val>${NC} ${GRAY}- Delete specific record${NC}\n\n"
-                printf '%b' " ${YELLOW}[ 📦 BACKUP MANAGEMENT ]${NC}\n"
-                printf '%b' "   ${CYAN}backup <name> [--force]${NC}           ${GRAY}- Create a file structure backup${NC}\n"
-                printf '%b' "   ${CYAN}backups${NC}                           ${GRAY}- List all backups professionally${NC}\n"
-                printf '%b' "   ${CYAN}backup_restore <name> [--force]${NC}   ${GRAY}- Restore from backup${NC}\n"
-                printf '%b' "   ${CYAN}backup_delete <name> [--force]${NC}    ${GRAY}- Delete a backup file${NC}\n"
-                printf '%b' "   ${CYAN}backup_schedule <func> <true|false> <val>${NC} ${GRAY}- Automate backup functions${NC}\n"
-                printf '%b' "   ${CYAN}backup_configs <cfg> <val>${NC}      ${GRAY}- Show/Configure backup categories${NC}\n\n"
-                printf '%b' " ${YELLOW}[ 🛠 SYSTEM ]${NC}\n"
-                printf '%b' "   ${CYAN}system_terminate [--force]${NC}        ${GRAY}- Terminate processes and clean db_manage${NC}\n"
-                printf '%b' "   ${CYAN}system_process [kill <process>]${NC}   ${GRAY}- List or terminate system processes${NC}\n"
-                printf '%b' "   ${CYAN}clear${NC}                             ${GRAY}- Clear screen${NC}\n"
-                printf '%b' "   ${CYAN}help${NC}                              ${GRAY}- Show help menu${NC}\n"
-                printf '%b' "   ${CYAN}exit / quit${NC}                       ${GRAY}- Exit application${NC}\n\n"
-                printf '%b' "${CYAN}==================================================${NC}\n\n"
+            help)
+                show_help
                 ;;
-            "clear")
+            clear)
+                clear
+                ;;
+            use)
+                use_name="$args"
+                use_name="${use_name#\"}"; use_name="${use_name%\"}"
+                use_name="${use_name#\'}"; use_name="${use_name%\'}"
+                if [ -z "$use_name" ]; then
+                    printf '%b\n' "${RED}Error: Database name required. Usage: use <name>${NC}"
+                elif [ ! -f "db_manage/database/$use_name/$use_name.db" ]; then
+                    printf '%b\n' "${RED}Error: Database '$use_name' does not exist.${NC}"
+                else
+                    _dbm_python "$CURRENT_DB" use "$(printf '%q' "$use_name" | sed "s/^'//;s/'$//")"
+                    if [ $? -eq 0 ]; then CURRENT_DB="$use_name"; load_database_history; fi
+                fi
+                ;;
+            system_terminate)
+                _dbm_python "$CURRENT_DB" "$command" "$args"
+                if [ "$CURRENT_DB" != "none" ] && [ ! -f "db_manage/database/$CURRENT_DB/$CURRENT_DB.db" ]; then
+                    CURRENT_DB="none"
+                    load_database_history
+                fi
                 show_banner
                 ;;
-            "system_terminate")
-                OLD_IFS="$IFS"
-                IFS='&'
-                set -- $args
-                IFS="$OLD_IFS"
-                force_arg="$1"
-                force_arg=$(echo "$force_arg" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                
-                if ! confirm_action "$force_arg" "Terminate all system processes and delete the 'db_manage' directory"; then
-                    echo ""
-                    continue
+            drop_database)
+                _dbm_python "$CURRENT_DB" "$command" "$args"
+                if [ "$CURRENT_DB" != "none" ] && [ ! -f "db_manage/database/$CURRENT_DB/$CURRENT_DB.db" ]; then
+                    CURRENT_DB="none"
+                    load_database_history
                 fi
-                
-                if [ -d "db_manage/secrets" ]; then
-                    for pid_f in db_manage/secrets/backup_*.pid; do
-                        [ -f "$pid_f" ] || continue
-                        p=$(cat "$pid_f" 2>/dev/null)
-                        [ -n "$p" ] && kill "$p" 2>/dev/null
-                        rm -f "$pid_f"
-                    done
-                fi
-                if [ -d "db_manage/database" ]; then
-                    for db_dir in db_manage/database/*; do
-                        [ -d "$db_dir" ] || continue
-                        for api_type in public secret; do
-                            pid_file="$db_dir/api/$api_type/api.pid"
-                            if [ -f "$pid_file" ]; then
-                                pid=$(cat "$pid_file" 2>/dev/null)
-                                [ -n "$pid" ] && kill "$pid" 2>/dev/null
-                                rm -f "$pid_file"
-                            fi
-                        done
-                    done
-                fi
-                pkill -f "python3.*server.py" 2>/dev/null
-                
-                rm -rf db_manage
-                CURRENT_DB="none"
-                
-                mkdir -p db_manage/database db_manage/secrets db_manage/backups
-                [ -e "db_manage/secrets/secrets.env" ] || touch "db_manage/secrets/secrets.env"
-                [ -e "db_manage/secrets/database.cfg" ] || touch "db_manage/secrets/database.cfg"
-                [ -e "db_manage/secrets/api.cfg" ] || touch "db_manage/secrets/api.cfg"
-                [ -e "db_manage/secrets/backup_configs.cfg" ] || touch "db_manage/secrets/backup_configs.cfg"
-                [ -e "db_manage/secrets/backup_schedule.cfg" ] || touch "db_manage/secrets/backup_schedule.cfg"
-                init_backup_configs_file "db_manage/secrets/backup_configs.cfg"
-                init_backup_schedule_file "db_manage/secrets/backup_schedule.cfg"
-                
-                printf '%b' "${GREEN}System terminated successfully. All processes were terminated and db_manage directory was restored.${NC}\n"
-                echo ""
-                show_banner
                 ;;
-            "system_process")
-                args_clean=$(echo "$args" | tr '&' ' ')
-                set -- $args_clean
-                sp_action="$1"
-                sp_target="$2"
-                sp_action=$(echo "$sp_action" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                sp_target=$(echo "$sp_target" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-
-                if [ -z "$sp_action" ]; then
-                    printf '%b' "${CYAN}${BOLD}System Managed Processes:${NC}\n"
-                    has_procs=0
-                    if [ -d "db_manage/secrets" ]; then
-                        for pid_f in db_manage/secrets/backup_*.pid; do
-                            [ -f "$pid_f" ] || continue
-                            proc_name=$(basename "$pid_f" .pid | sed 's/^backup_//')
-                            p=$(cat "$pid_f" 2>/dev/null)
-                            status_val="${RED}Stopped${NC}"
-                            if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
-                                status_val="${GREEN}Running${NC}"
-                                pid_disp="${GREEN}PID: $p${NC}"
-                                has_procs=1
-                            else
-                                pid_disp="${RED}Stopped${NC}"
-                                rm -f "$pid_f"
-                                continue
-                            fi
-                            printf '%b' "  - ${CYAN}Backup Process:${NC} Process Name: ${YELLOW}${proc_name}${NC}, Database: ${YELLOW}System${NC} -> Status: ${status_val}, Process: ${pid_disp}\n"
-                        done
-                    fi
-                    if [ -d "db_manage/database" ]; then
-                        for db_d in db_manage/database/*; do
-                            [ -d "$db_d" ] || continue
-                            dbname=$(basename "$db_d")
-                            for api_t in public secret; do
-                                pid_f="$db_d/api/$api_t/api.pid"
-                                [ -f "$pid_f" ] || continue
-                                p=$(cat "$pid_f" 2>/dev/null)
-                                status_val="${RED}Stopped${NC}"
-                                if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
-                                    status_val="${GREEN}Running${NC}"
-                                    pid_disp="${GREEN}PID: $p${NC}"
-                                    has_procs=1
-                                else
-                                    pid_disp="${RED}Stopped${NC}"
-                                    rm -f "$pid_f"
-                                    continue
-                                fi
-                                printf '%b' "  - ${CYAN}API Server (${api_t}):${NC} Process Name: ${YELLOW}${dbname}-${api_t}${NC}, Database: ${YELLOW}${dbname}${NC} -> Status: ${status_val}, Process: ${pid_disp}\n"
-                            done
-                        done
-                    fi
-                    [ "$has_procs" -eq 0 ] && printf '%b' "  (No active managed processes found)\n"
-                elif [ "$sp_action" = "kill" ]; then
-                    if [ -z "$sp_target" ]; then
-                        printf '%b' "${RED}Error: Process identifier or PID required. Usage: system_process kill <process|pid>${NC}\n"
-                    else
-                        killed=0
-                        if echo "$sp_target" | grep -q '^[0-9]\+$'; then
-                            if kill -0 "$sp_target" 2>/dev/null; then
-                                kill "$sp_target" 2>/dev/null || kill -9 "$sp_target" 2>/dev/null
-                                killed=1
-                            fi
-                        fi
-                        if [ -f "db_manage/secrets/backup_${sp_target}.pid" ]; then
-                            p=$(cat "db_manage/secrets/backup_${sp_target}.pid" 2>/dev/null)
-                            if [ -n "$p" ]; then
-                                kill "$p" 2>/dev/null || kill -9 "$p" 2>/dev/null
-                            fi
-                            rm -f "db_manage/secrets/backup_${sp_target}.pid"
-                            killed=1
-                        fi
-                        if [ -d "db_manage/secrets" ]; then
-                            for pid_f in db_manage/secrets/backup_*.pid; do
-                                [ -f "$pid_f" ] || continue
-                                p=$(cat "$pid_f" 2>/dev/null)
-                                if [ "$p" = "$sp_target" ]; then
-                                    kill "$p" 2>/dev/null || kill -9 "$p" 2>/dev/null
-                                    rm -f "$pid_f"
-                                    killed=1
-                                fi
-                            done
-                        fi
-                        if [ -d "db_manage/database" ]; then
-                            for db_d in db_manage/database/*; do
-                                [ -d "$db_d" ] || continue
-                                dbname=$(basename "$db_d")
-                                for api_t in public secret; do
-                                    pid_f="$db_d/api/$api_t/api.pid"
-                                    if [ -f "$pid_f" ]; then
-                                        p=$(cat "$pid_f" 2>/dev/null)
-                                        if [ "$dbname" = "$sp_target" ] || [ "${dbname}-${api_t}" = "$sp_target" ] || [ "$api_t" = "$sp_target" ] || [ "$p" = "$sp_target" ]; then
-                                            if [ -n "$p" ]; then
-                                                kill "$p" 2>/dev/null || kill -9 "$p" 2>/dev/null
-                                            fi
-                                            rm -f "$pid_f"
-                                            killed=1
-                                        fi
-                                    fi
-                                done
-                            done
-                        fi
-                        if [ "$killed" -eq 1 ]; then
-                            printf '%b' "${GREEN}Process '$sp_target' terminated successfully.${NC}\n"
-                        else
-                            printf '%b' "${RED}Error: Process '$sp_target' not found or could not be terminated.${NC}\n"
-                        fi
-                    fi
-                else
-                    printf '%b' "${RED}Error: Invalid action. Usage: system_process [kill <process>]${NC}\n"
+            rename_database)
+                _old_name="${args%%[[:space:]]*}"
+                _new_name="${args#"$_old_name"}"
+                _new_name=$(trim_text "$_new_name")
+                _old_name="${_old_name#\"}"; _old_name="${_old_name%\"}"
+                _new_name="${_new_name#\"}"; _new_name="${_new_name%\"}"
+                _dbm_python "$CURRENT_DB" "$command" "$args"
+                if [ "$CURRENT_DB" = "$_old_name" ] && [ -f "db_manage/database/$_new_name/$_new_name.db" ]; then
+                    CURRENT_DB="$_new_name"
+                    load_database_history
                 fi
-                echo ""
-                ;;
-            "backup")
-                OLD_IFS="$IFS"
-                IFS='&'
-                set -- $args
-                IFS="$OLD_IFS"
-                bname="$1"
-                force_arg="$2"
-                bname=$(echo "$bname" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                force_arg=$(echo "$force_arg" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                [ "$bname" = "--force" ] && { force_arg="--force"; bname=""; }
-                if [ -z "$bname" ]; then
-                    def_prefix="auto"
-                    if [ -f "db_manage/secrets/backup_configs.cfg" ]; then
-                        val=$(grep "^default_backup_name=" "db_manage/secrets/backup_configs.cfg" 2>/dev/null | cut -d'=' -f2 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                        [ -n "$val" ] && def_prefix="$val"
-                    fi
-                    bname="${def_prefix}-$(date +%Y-%m-%d_%H-%M-%S)"
-                fi
-                
-                bfile="db_manage/backups/$bname.tar.gz"
-                if [ -e "$bfile" ]; then
-                    if ! confirm_action "$force_arg" "Backup '$bname' already exists and will be overwritten"; then
-                        echo ""
-                        continue
-                    fi
-                fi
-                
-                mkdir -p db_manage/backups
-                tar -czf "$bfile" db_manage 2>/dev/null
-                printf '%b' "${GREEN}Backup '$bname' created successfully in 'db_manage/backups/'.${NC}\n"
-                echo ""
-                ;;
-            "backups")
-                printf '%b' "${CYAN}${BOLD}Available Backups:${NC}\n"
-                python3 -c '
-import os, glob
-b_dir = "db_manage/backups"
-if not os.path.exists(b_dir):
-    print("  (No backups found)")
-else:
-    files = sorted(glob.glob(os.path.join(b_dir, "*.tar.gz")), key=os.path.getmtime)
-    if not files:
-        print("  (No backups found)")
-    else:
-        names = [os.path.basename(f)[:-7] for f in files]
-        max_len = max(len(n) for n in names) if names else 10
-        max_len = max(max_len, 20)
-        title_plain = "BACKUP NAME"
-        title_colored = f"\033[1;36m{title_plain:<{max_len}}\033[0m"
-        print("┌" + "─" * (max_len + 4) + "┐")
-        print(f"│ {title_colored} │")
-        print("├" + "─" * (max_len + 4) + "┤")
-        for n in names:
-            n_padded = f"{n:<{max_len}}"
-            print(f"│ {n_padded} │")
-        print("└" + "─" * (max_len + 4) + "┘")
-'
-                echo ""
-                ;;
-            "backup_restore")
-                OLD_IFS="$IFS"
-                IFS='&'
-                set -- $args
-                IFS="$OLD_IFS"
-                bname="$1"
-                force_arg="$2"
-                bname=$(echo "$bname" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                force_arg=$(echo "$force_arg" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                if [ -z "$bname" ]; then
-                    printf '%b' "${RED}Error: Backup name required. Usage: backup_restore <backup-name> [--force]${NC}\n"
-                else
-                    bfile="db_manage/backups/$bname.tar.gz"
-                    if [ ! -e "$bfile" ]; then
-                        printf '%b' "${RED}Error: Backup '$bname' does not exist.${NC}\n"
-                    else
-                        if ! confirm_action "$force_arg" "Restore backup '$bname' (this will overwrite current data)"; then
-                            echo ""
-                            continue
-                        fi
-                        for db_dir in db_manage/database/*; do
-                            [ -d "$db_dir" ] || continue
-                            for api_type in public secret; do
-                                pid_file="$db_dir/api/$api_type/api.pid"
-                                if [ -f "$pid_file" ]; then
-                                    pid=$(cat "$pid_file" 2>/dev/null)
-                                    [ -n "$pid" ] && kill "$pid" 2>/dev/null
-                                    rm -f "$pid_file"
-                                fi
-                            done
-                        done
-                        for pid_file in db_manage/secrets/backup_*.pid; do
-                            [ -f "$pid_file" ] || continue
-                            pid=$(cat "$pid_file" 2>/dev/null)
-                            [ -n "$pid" ] && kill "$pid" 2>/dev/null
-                            rm -f "$pid_file"
-                        done
-                        pkill -f "python3.*server.py" 2>/dev/null
-                        tar -xzf "$bfile" 2>/dev/null
-                        printf '%b' "${GREEN}All Python servers were terminated and backup '$bname' was restored successfully.${NC}\n"
-                    fi
-                fi
-                echo ""
-                ;;
-            "backup_delete")
-                OLD_IFS="$IFS"
-                IFS='&'
-                set -- $args
-                IFS="$OLD_IFS"
-                bname="$1"
-                force_arg="$2"
-                bname=$(echo "$bname" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                force_arg=$(echo "$force_arg" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                if [ -z "$bname" ]; then
-                    printf '%b' "${RED}Error: Backup name required. Usage: backup_delete <backup-name> [--force]${NC}\n"
-                else
-                    bfile="db_manage/backups/$bname.tar.gz"
-                    if [ ! -e "$bfile" ]; then
-                        printf '%b' "${RED}Error: Backup '$bname' does not exist.${NC}\n"
-                    else
-                        if ! confirm_action "$force_arg" "Delete backup '$bname'"; then
-                            echo ""
-                            continue
-                        fi
-                        rm -f "$bfile"
-                        printf '%b' "${GREEN}Backup '$bname' deleted successfully.${NC}\n"
-                    fi
-                fi
-                echo ""
-                ;;
-            "backup_configs")
-                cfg_file="db_manage/secrets/backup_configs.cfg"
-                init_backup_configs_file "$cfg_file"
-                OLD_IFS="$IFS"
-                IFS='&'
-                set -- $args
-                IFS="$OLD_IFS"
-                c_key="$1"
-                c_val="$2"
-                c_key=$(echo "$c_key" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                c_val=$(echo "$c_val" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                if [ -z "$c_key" ]; then
-                    printf '%b' "${CYAN}${BOLD}Categorized Backup System Configurations:${NC}\n"
-                    curr_cat=""
-                    while IFS='=' read -r k v || [ -n "$k" ]; do
-                        k=$(echo "$k" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/\r//g')
-                        v=$(echo "$v" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/\r//g')
-                        case "$k" in
-                            [[]*[]])
-                                curr_cat="$k"
-                                printf '%b' "\n  ${YELLOW}${curr_cat}${NC}\n"
-                                ;;
-                            *=*)
-                                [ -n "$k" ] && printf '%b' "    - ${CYAN}$k${NC}: ${GREEN}$v${NC}\n"
-                                ;;
-                            *)
-                                if [ -n "$k" ] && [ -n "$v" ]; then
-                                    printf '%b' "    - ${CYAN}$k${NC}: ${GREEN}$v${NC}\n"
-                                fi
-                                ;;
-                        esac
-                    done < "$cfg_file"
-                elif [ -n "$c_key" ] && [ -z "$c_val" ]; then
-                    printf '%b' "${RED}Error: Missing configuration value. Usage: backup_configs <cfg> <val>${NC}\n"
-                else
-                    temp_f="$cfg_file.tmp"
-                    found_c=0
-                    while IFS='=' read -r k v || [ -n "$k" ]; do
-                        case "$k" in
-                            [[]*[]])
-                                echo "$k" >> "$temp_f"
-                                ;;
-                            *)
-                                parts_k=$(echo "$k" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                                if [ "$parts_k" = "$c_key" ]; then
-                                    echo "$k=$c_val" >> "$temp_f"
-                                    found_c=1
-                                else
-                                    [ -n "$k" ] && echo "$k=$v" >> "$temp_f"
-                                fi
-                                ;;
-                        esac
-                    done < "$cfg_file"
-                    mv "$temp_f" "$cfg_file"
-                    if [ "$found_c" -eq 1 ]; then
-                        printf '%b' "${GREEN}Backup configuration '$c_key' updated successfully to '$c_val'.${NC}\n"
-                    else
-                        printf '%b' "${RED}Error: Backup configuration key '$c_key' does not exist.${NC}\n"
-                    fi
-                fi
-                echo ""
-                ;;
-            "backup_schedule")
-                s_file="db_manage/secrets/backup_schedule.cfg"
-                init_backup_schedule_file "$s_file"
-                OLD_IFS="$IFS"
-                IFS='&'
-                set -- $args
-                IFS="$OLD_IFS"
-                s_func="$1"
-                s_status="$2"
-                s_val="$3"
-                s_func=$(echo "$s_func" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                s_status=$(echo "$s_status" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                s_val=$(echo "$s_val" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-
-                if [ -z "$s_func" ]; then
-                    printf '%b' "${CYAN}${BOLD}Backup Schedule Functions:${NC}\n"
-                    while IFS='=' read -r k v || [ -n "$k" ]; do
-                        [ -z "$k" ] && continue
-                        fn_name="$k"
-                        fn_status_val=$(echo "$v" | cut -d':' -f1)
-                        fn_interval=$(echo "$v" | cut -d':' -f2)
-                        pid_file="db_manage/secrets/backup_${fn_name}.pid"
-                        pid_val="${RED}Stopped${NC}"
-                        if [ -f "$pid_file" ]; then
-                            p=$(cat "$pid_file" 2>/dev/null)
-                            if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
-                                pid_val="${GREEN}PID: $p${NC}"
-                            else
-                                rm -f "$pid_file"
-                            fi
-                        fi
-                        printf '%b' "  - ${CYAN}${fn_name}${NC} -> Status: ${YELLOW}${fn_status_val}${NC}, Interval: ${BLUE}${fn_interval}${NC}, Process: ${pid_val}\n"
-                    done < "$s_file"
-                elif [ -n "$s_func" ] && [ -z "$s_status" ]; then
-                    printf '%b' "${RED}Error: Missing status. Usage: backup_schedule <function> <true|false> [interval]${NC}\n"
-                elif [ "$s_status" != "true" ] && [ "$s_status" != "false" ]; then
-                    printf '%b' "${RED}Error: Status must be 'true' or 'false'.${NC}\n"
-                else
-                    [ -z "$s_val" ] && s_val="1h"
-                    temp_f="$s_file.tmp"
-                    found_s=0
-                    while IFS='=' read -r k v || [ -n "$k" ]; do
-                        [ -z "$k" ] && continue
-                        if [ "$k" = "$s_func" ]; then
-                            echo "$k=$s_status:$s_val" >> "$temp_f"
-                            found_s=1
-                        else
-                            echo "$k=$v" >> "$temp_f"
-                        fi
-                    done < "$s_file"
-                    mv "$temp_f" "$s_file"
-
-                    pid_file="db_manage/secrets/backup_${s_func}.pid"
-                    if [ -f "$pid_file" ]; then
-                        p=$(cat "$pid_file" 2>/dev/null)
-                        [ -n "$p" ] && kill "$p" 2>/dev/null
-                        rm -f "$pid_file"
-                    fi
-
-                    if [ "$s_status" = "true" ]; then
-                        secs=$(parse_interval "$s_val")
-                        server_script="db_manage/secrets/backup_server.py"
-                        [ ! -f "$server_script" ] && generate_backup_server_script "$server_script"
-                        nohup python3 "$server_script" "$s_func" "$secs" > "db_manage/secrets/backup_${s_func}.log" 2>&1 &
-                        echo $! > "$pid_file"
-                        disown $! 2>/dev/null
-                        printf '%b' "${GREEN}Backup function '$s_func' scheduled successfully with interval $s_val.${NC}\n"
-                    else
-                        printf '%b' "${GREEN}Backup function '$s_func' disabled successfully.${NC}\n"
-                    fi
-                fi
-                echo ""
-                ;;
-            "use")
-                OLD_IFS="$IFS"
-                IFS='&'
-                set -- $args
-                IFS="$OLD_IFS"
-                db_name=$(echo "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                if [ -z "$db_name" ]; then
-                    printf '%b' "${RED}Error: Database name required. Usage: use <name>${NC}\n"
-                elif [ -d "db_manage/database/$db_name" ] && [ -e "db_manage/database/$db_name/$db_name.db" ]; then
-                    CURRENT_DB="$db_name"
-                    printf '%b' "${GREEN}Switched to database: $CURRENT_DB${NC}\n"
-                else
-                    printf '%b' "${RED}Error: Database '$db_name' does not exist.${NC}\n"
-                fi
-                echo ""
-                ;;
-            "create_database")
-                if [ -z "$args" ]; then
-                    printf '%b' "${RED}Error: Database name required. Usage: create_database <name>${NC}\n"
-                else
-                    OLD_IFS="$IFS"
-                    IFS='&'
-                    set -- $args
-                    IFS="$OLD_IFS"
-                    for db in "$@"; do
-                        db=$(echo "$db" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                        [ -z "$db" ] && continue
-                        if [ -d "db_manage/database/$db" ]; then
-                            printf '%b' "${RED}Error: Database '$db' already exists.${NC}\n"
-                        else
-                            mkdir -p "db_manage/database/$db/tables" "db_manage/database/$db/api/public" "db_manage/database/$db/api/secret"
-                            echo "{\"database\": \"$db\", \"tables\": {}}" > "db_manage/database/$db/$db.db"
-                            generate_server_script "db_manage/database/$db/api/public/server.py"
-                            generate_server_script "db_manage/database/$db/api/secret/server.py"
-                            init_permissions_file "db_manage/database/$db/api/public/permissions.cfg"
-                            printf '%b' "${GREEN}Database '$db' created successfully.${NC}\n"
-                        fi
-                    done
-                fi
-                echo ""
-                ;;
-            "drop_database")
-                if [ -z "$args" ]; then
-                    printf '%b' "${RED}Error: Database name required. Usage: drop_database <name>${NC}\n"
-                else
-                    OLD_IFS="$IFS"
-                    IFS='&'
-                    set -- $args
-                    IFS="$OLD_IFS"
-                    for db in "$@"; do
-                        db=$(echo "$db" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                        [ -z "$db" ] && continue
-                        if [ -d "db_manage/database/$db" ]; then
-                            for api_type in public secret; do
-                                pid_file="db_manage/database/$db/api/$api_type/api.pid"
-                                if [ -f "$pid_file" ]; then
-                                    pid=$(cat "$pid_file" 2>/dev/null)
-                                    [ -n "$pid" ] && kill "$pid" 2>/dev/null
-                                fi
-                            done
-                            rm -rf "db_manage/database/$db"
-                            if [ "$CURRENT_DB" = "$db" ]; then
-                                CURRENT_DB="none"
-                            fi
-                            printf '%b' "${GREEN}Database '$db' dropped successfully.${NC}\n"
-                        else
-                            printf '%b' "${RED}Error: Database '$db' does not exist.${NC}\n"
-                        fi
-                    done
-                fi
-                echo ""
-                ;;
-            "rename_database")
-                OLD_IFS="$IFS"
-                IFS='&'
-                set -- $args
-                IFS="$OLD_IFS"
-                old_name=$(echo "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                new_name=$(echo "$2" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                if [ -z "$new_name" ]; then
-                    set -- $args
-                    old_name="$1"
-                    new_name="$2"
-                fi
-                if [ -z "$old_name" ] || [ -z "$new_name" ]; then
-                    printf '%b' "${RED}Error: Usage: rename_database <name> <newname>${NC}\n"
-                elif [ ! -d "db_manage/database/$old_name" ]; then
-                    printf '%b' "${RED}Error: Database '$old_name' does not exist.${NC}\n"
-                elif [ -d "db_manage/database/$new_name" ]; then
-                    printf '%b' "${RED}Error: Database '$new_name' already exists.${NC}\n"
-                else
-                    mv "db_manage/database/$old_name" "db_manage/database/$new_name"
-                    if [ -e "db_manage/database/$new_name/$old_name.db" ]; then
-                        mv "db_manage/database/$new_name/$old_name.db" "db_manage/database/$new_name/$new_name.db"
-                        python3 -c "import json, os; path='db_manage/database/$new_name/$new_name.db'; data=json.load(open(path)); data['database']='$new_name'; json.dump(data, open(path, 'w'))"
-                    fi
-                    if [ "$CURRENT_DB" = "$old_name" ]; then
-                        CURRENT_DB="$new_name"
-                    fi
-                    printf '%b' "${GREEN}Database '$old_name' renamed to '$new_name' successfully.${NC}\n"
-                fi
-                echo ""
-                ;;
-            "describe")
-                if [ -z "$args" ]; then
-                    printf '%b' "${RED}Error: Database name required. Usage: describe <name>${NC}\n"
-                else
-                    OLD_IFS="$IFS"
-                    IFS='&'
-                    set -- $args
-                    IFS="$OLD_IFS"
-                    for db in "$@"; do
-                        db=$(echo "$db" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                        [ -z "$db" ] && continue
-                        if [ -e "db_manage/database/$db/$db.db" ]; then
-                            printf '%b' "${CYAN}${BOLD}Database Structure for '$db':${NC}\n"
-                            cat "db_manage/database/$db/$db.db"
-                            echo ""
-                        else
-                            printf '%b' "${RED}Error: Database '$db' does not exist.${NC}\n"
-                        fi
-                    done
-                fi
-                echo ""
-                ;;
-            "dump_db")
-                if [ "$CURRENT_DB" = "none" ]; then
-                    printf '%b' "${RED}Error: No active database. Use 'use <name>' first.${NC}\n"
-                else
-                    printf '%b' "${CYAN}==================================================${NC}\n"
-                    printf '%b' "${CYAN}${BOLD}     UNIVERSAL DATABASE DUMP: $CURRENT_DB${NC}\n"
-                    printf '%b' "${CYAN}==================================================${NC}\n"
-                    printf '%b' "${YELLOW}[Metadata Header]${NC}\n"
-                    if [ -e "db_manage/database/${CURRENT_DB}/${CURRENT_DB}.db" ]; then
-                        cat "db_manage/database/${CURRENT_DB}/${CURRENT_DB}.db"
-                    fi
-                    printf '%b' "\n${YELLOW}[Relational Tables & Data Records]${NC}\n"
-                    
-                    tbl_dir="db_manage/database/${CURRENT_DB}/tables"
-                    if [ -d "$tbl_dir" ]; then
-                        for tbl in "$tbl_dir"/*; do
-                            [ -d "$tbl" ] || continue
-                            tblname=$(basename "$tbl")
-                            printf '%b' "\n${CYAN}${BOLD}Table: $tblname${NC}\n"
-                            print_professional_table "$tbl"
-                        done
-                    else
-                        printf '%s\n' "  (No tables found)"
-                    fi
-                    printf '%b' "${CYAN}==================================================${NC}\n"
-                fi
-                echo ""
-                ;;
-            "create_table")
-                if [ "$CURRENT_DB" = "none" ]; then
-                    printf '%b' "${RED}Error: No active database. Use 'use <name>' first.${NC}\n"
-                elif [ -z "$args" ]; then
-                    printf '%b' "${RED}Error: Table name required. Usage: create_table <name>${NC}\n"
-                else
-                    OLD_IFS="$IFS"
-                    IFS='&'
-                    set -- $args
-                    IFS="$OLD_IFS"
-                    for tbl in "$@"; do
-                        tbl=$(echo "$tbl" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                        [ -z "$tbl" ] && continue
-                        tbl_dir="db_manage/database/${CURRENT_DB}/tables/$tbl"
-                        if [ -e "$tbl_dir" ]; then
-                            printf '%b' "${RED}Error: Table '$tbl' already exists.${NC}\n"
-                        else
-                            mkdir -p "$tbl_dir"
-                            echo "id" > "$tbl_dir/columns"
-                            touch "$tbl_dir/tables"
-                            printf '%b' "${GREEN}Table '$tbl' created successfully.${NC}\n"
-                        fi
-                    done
-                fi
-                echo ""
-                ;;
-            "drop_table")
-                if [ "$CURRENT_DB" = "none" ]; then
-                    printf '%b' "${RED}Error: No active database. Use 'use <name>' first.${NC}\n"
-                elif [ -z "$args" ]; then
-                    printf '%b' "${RED}Error: Table name required. Usage: drop_table <name>${NC}\n"
-                else
-                    OLD_IFS="$IFS"
-                    IFS='&'
-                    set -- $args
-                    IFS="$OLD_IFS"
-                    for tbl in "$@"; do
-                        tbl=$(echo "$tbl" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                        [ -z "$tbl" ] && continue
-                        tbl_dir="db_manage/database/${CURRENT_DB}/tables/$tbl"
-                        if [ -e "$tbl_dir" ]; then
-                            rm -rf "$tbl_dir"
-                            printf '%b' "${GREEN}Table '$tbl' dropped successfully.${NC}\n"
-                        else
-                            printf '%b' "${RED}Error: Table '$tbl' does not exist.${NC}\n"
-                        fi
-                    done
-                fi
-                echo ""
-                ;;
-            "rename_table")
-                if [ "$CURRENT_DB" = "none" ]; then
-                    printf '%b' "${RED}Error: No active database. Use 'use <name>' first.${NC}\n"
-                else
-                    OLD_IFS="$IFS"
-                    IFS='&'
-                    set -- $args
-                    IFS="$OLD_IFS"
-                    old_tbl="$1"
-                    new_tbl="$2"
-                    old_tbl=$(echo "$old_tbl" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                    new_tbl=$(echo "$new_tbl" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                    if [ -z "$new_tbl" ]; then
-                        set -- $args
-                        old_tbl="$1"
-                        new_tbl="$2"
-                    fi
-                    if [ -z "$old_tbl" ] || [ -z "$new_tbl" ]; then
-                        printf '%b' "${RED}Error: Usage: rename_table <name> <newname>${NC}\n"
-                    elif [ ! -e "db_manage/database/${CURRENT_DB}/tables/$old_tbl" ]; then
-                        printf '%b' "${RED}Error: Table '$old_tbl' does not exist.${NC}\n"
-                    elif [ -e "db_manage/database/${CURRENT_DB}/tables/$new_tbl" ]; then
-                        printf '%b' "${RED}Error: Table '$new_tbl' already exists.${NC}\n"
-                    else
-                        mv "db_manage/database/${CURRENT_DB}/tables/$old_tbl" "db_manage/database/${CURRENT_DB}/tables/$new_tbl"
-                        printf '%b' "${GREEN}Table '$old_tbl' renamed to '$new_tbl' successfully.${NC}\n"
-                    fi
-                fi
-                echo ""
-                ;;
-            "create_column")
-                if [ "$CURRENT_DB" = "none" ]; then
-                    printf '%b' "${RED}Error: No active database. Use 'use <name>' first.${NC}\n"
-                elif [ -z "$args" ]; then
-                    printf '%b' "${RED}Error: Usage: create_column <tbl> <col>${NC}\n"
-                else
-                    args_clean=$(echo "$args" | tr '&' ' ')
-                    set -- $args_clean
-                    tbl_name="$1"
-                    tbl_name=$(echo "$tbl_name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                    if [ -z "$tbl_name" ]; then
-                        printf '%b' "${RED}Error: Usage: create_column <tbl> <col>${NC}\n"
-                    elif [ ! -e "db_manage/database/${CURRENT_DB}/tables/$tbl_name" ]; then
-                        printf '%b' "${RED}Error: Table '$tbl_name' does not exist.${NC}\n"
-                    else
-                        shift
-                        if [ $# -eq 0 ]; then
-                            printf '%b' "${RED}Error: Column name required.${NC}\n"
-                        else
-                            tbl_dir="db_manage/database/${CURRENT_DB}/tables/$tbl_name"
-                            for col_name in "$@"; do
-                                col_name=$(echo "$col_name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                                [ -z "$col_name" ] && continue
-                                res=$(python3 -c '
-import sys, os
-tbl_dir = sys.argv[1]
-col_name = sys.argv[2]
-cols_file = os.path.join(tbl_dir, "columns")
-data_file = os.path.join(tbl_dir, "tables")
-if not os.path.exists(cols_file):
-    sys.exit(1)
-with open(cols_file, "r") as f:
-    cols = [c.replace("\r", "").strip() for c in f if c.strip()]
-if col_name in cols:
-    print("EXISTS")
-    sys.exit(0)
-cols.append(col_name)
-with open(cols_file, "w") as f:
-    for c in cols:
-        f.write(c + "\n")
-if os.path.exists(data_file):
-    with open(data_file, "r") as f:
-        lines = [line.replace("\r", "").strip() for line in f if line.strip()]
-    new_lines = []
-    for line in lines:
-        parts = [c.strip() for c in line.split(" ")]
-        while len(parts) < len(cols) - 1:
-            parts.append("")
-        parts.append("")
-        new_lines.append(" ".join(parts))
-    with open(data_file, "w") as f:
-        for l in new_lines:
-            f.write(l + "\n")
-print("ADDED")
-' "$tbl_dir" "$col_name")
-                                if [ "$res" = "EXISTS" ]; then
-                                    printf '%b' "${RED}Error: Column '$col_name' already exists in table '$tbl_name'.${NC}\n"
-                                else
-                                    printf '%b' "${GREEN}Column '$col_name' added to table '$tbl_name'.${NC}\n"
-                                fi
-                            done
-                        fi
-                    fi
-                fi
-                echo ""
-                ;;
-            "drop_column")
-                if [ "$CURRENT_DB" = "none" ]; then
-                    printf '%b' "${RED}Error: No active database. Use 'use <name>' first.${NC}\n"
-                else
-                    OLD_IFS="$IFS"
-                    IFS='&'
-                    set -- $args
-                    IFS="$OLD_IFS"
-                    tbl_name="$1"
-                    col_name="$2"
-                    tbl_name=$(echo "$tbl_name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                    col_name=$(echo "$col_name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                    if [ -z "$tbl_name" ] || [ -z "$col_name" ]; then
-                        printf '%b' "${RED}Error: Usage: drop_column <tbl> <col>${NC}\n"
-                    elif [ ! -e "db_manage/database/${CURRENT_DB}/tables/$tbl_name" ]; then
-                        printf '%b' "${RED}Error: Table '$tbl_name' does not exist.${NC}\n"
-                    else
-                        tbl_dir="db_manage/database/${CURRENT_DB}/tables/$tbl_name"
-                        python3 -c '
-import sys, os
-tbl_dir = sys.argv[1]
-col_name = sys.argv[2]
-cols_file = os.path.join(tbl_dir, "columns")
-data_file = os.path.join(tbl_dir, "tables")
-if not os.path.exists(cols_file):
-    print("Error: Table not found.")
-    sys.exit(1)
-with open(cols_file, "r") as f:
-    cols = [c.replace("\r", "").strip() for c in f if c.strip()]
-if col_name not in cols:
-    print(f"Error: Column '\''{col_name}'\'' not found.")
-    sys.exit(1)
-if col_name == "id":
-    print("Error: Cannot drop primary id column.")
-    sys.exit(1)
-col_idx = cols.index(col_name)
-cols.pop(col_idx)
-with open(cols_file, "w") as f:
-    for c in cols:
-        f.write(c + "\n")
-if os.path.exists(data_file):
-    with open(data_file, "r") as f:
-        lines = [line.replace("\r", "").strip() for line in f if line.strip()]
-    new_lines = []
-    for line in lines:
-        parts = [c.strip() for c in line.split(" ")]
-        while len(parts) <= col_idx:
-            parts.append("")
-        parts.pop(col_idx)
-        new_lines.append(" ".join(parts))
-    with open(data_file, "w") as f:
-        for l in new_lines:
-            f.write(l + "\n")
-print("SUCCESS")
-' "$tbl_dir" "$col_name" > "$tbl_dir/result.tmp"
-                        if grep -q "SUCCESS" "$tbl_dir/result.tmp"; then
-                            rm -f "$tbl_dir/result.tmp"
-                            printf '%b' "${GREEN}Column '$col_name' dropped from table '$tbl_name'.${NC}\n"
-                        else
-                            cat "$tbl_dir/result.tmp" | sed 's/^/\033[0;31m/;s/$/\033[0m/'
-                            rm -f "$tbl_dir/result.tmp"
-                        fi
-                    fi
-                fi
-                echo ""
-                ;;
-            "show_columns")
-                if [ "$CURRENT_DB" = "none" ]; then
-                    printf '%b' "${RED}Error: No active database. Use 'use <name>' first.${NC}\n"
-                else
-                    OLD_IFS="$IFS"
-                    IFS='&'
-                    set -- $args
-                    IFS="$OLD_IFS"
-                    tbl_name="$1"
-                    tbl_name=$(echo "$tbl_name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                    if [ -z "$tbl_name" ]; then
-                        printf '%b' "${RED}Error: Usage: show_columns <tbl>${NC}\n"
-                    elif [ ! -e "db_manage/database/${CURRENT_DB}/tables/$tbl_name" ]; then
-                        printf '%b' "${RED}Error: Table '$tbl_name' does not exist.${NC}\n"
-                    else
-                        tbl_dir="db_manage/database/${CURRENT_DB}/tables/$tbl_name"
-                        if [ ! -s "$tbl_dir/columns" ]; then
-                            printf '%b' "${RED}Error: Table '$tbl_name' has no columns.${NC}\n"
-                        else
-                            printf '%b' "${CYAN}${BOLD}Columns in table '$tbl_name':${NC}\n"
-                            print_professional_columns "$tbl_dir"
-                        fi
-                    fi
-                fi
-                echo ""
-                ;;
-            "rename_column")
-                if [ "$CURRENT_DB" = "none" ]; then
-                    printf '%b' "${RED}Error: No active database. Use 'use <name>' first.${NC}\n"
-                else
-                    OLD_IFS="$IFS"
-                    IFS='&'
-                    set -- $args
-                    IFS="$OLD_IFS"
-                    tbl_name="$1"
-                    old_col="$2"
-                    new_col="$3"
-                    tbl_name=$(echo "$tbl_name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                    old_col=$(echo "$old_col" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                    new_col=$(echo "$new_col" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                    if [ -z "$tbl_name" ] || [ -z "$old_col" ] || [ -z "$new_col" ]; then
-                        printf '%b' "${RED}Error: Usage: rename_column <tbl> <col> <newcol>${NC}\n"
-                    elif [ ! -e "db_manage/database/${CURRENT_DB}/tables/$tbl_name" ]; then
-                        printf '%b' "${RED}Error: Table '$tbl_name' does not exist.${NC}\n"
-                    else
-                        tbl_dir="db_manage/database/${CURRENT_DB}/tables/$tbl_name"
-                        cols_file="$tbl_dir/columns"
-                        found=0
-                        temp_cols="$cols_file.tmp"
-                        while IFS= read -r col || [ -n "$col" ]; do
-                            col=$(echo "$col" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/\r//g')
-                            [ -z "$col" ] && continue
-                            if [ "$col" = "$old_col" ]; then
-                                echo "$new_col" >> "$temp_cols"
-                                found=1
-                            else
-                                echo "$col" >> "$temp_cols"
-                            fi
-                        done < "$cols_file"
-                        mv "$temp_cols" "$cols_file"
-                        
-                        if [ "$found" -eq 1 ]; then
-                            printf '%b' "${GREEN}Column '$old_col' renamed to '$new_col'.${NC}\n"
-                        else
-                            printf '%b' "${RED}Error: Column '$old_col' not found.${NC}\n"
-                        fi
-                    fi
-                fi
-                echo ""
-                ;;
-            "show_databases")
-                db_count=0
-                if [ -d "db_manage/database" ]; then
-                    for db_dir in db_manage/database/*; do
-                        [ -d "$db_dir" ] || continue
-                        dbname=$(basename "$db_dir")
-                        [ -e "$db_dir/$dbname.db" ] && db_count=$(expr "$db_count" + 1)
-                    done
-                fi
-
-                if [ "$db_count" -eq 0 ]; then
-                    printf '%b' "${RED}Error: No databases exist.${NC}\n"
-                else
-                    printf '%b' "${CYAN}${BOLD}Available databases:${NC}\n"
-                    for db_dir in db_manage/database/*; do
-                        [ -d "$db_dir" ] || continue
-                        dbname=$(basename "$db_dir")
-                        [ -e "$db_dir/$dbname.db" ] && printf '%b' "  - ${GREEN}$dbname${NC}\n"
-                    done
-                fi
-                echo ""
-                ;;
-            "show_tables")
-                if [ "$CURRENT_DB" = "none" ]; then
-                    printf '%b' "${RED}Error: No active database. Use 'use <name>' first.${NC}\n"
-                else
-                    OLD_IFS="$IFS"
-                    IFS='&'
-                    set -- $args
-                    IFS="$OLD_IFS"
-                    target_tbl="$1"
-                    target_tbl=$(echo "$target_tbl" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                    
-                    if [ -n "$target_tbl" ]; then
-                        tbl_dir="db_manage/database/${CURRENT_DB}/tables/$target_tbl"
-                        if [ -e "$tbl_dir" ]; then
-                            printf '%b' "${CYAN}${BOLD}Complete Table View: '$target_tbl'${NC}\n"
-                            print_professional_table "$tbl_dir"
-                        else
-                            printf '%b' "${RED}Error: Table '$target_tbl' does not exist in database '$CURRENT_DB'.${NC}\n"
-                        fi
-                    else
-                        tbl_count=0
-                        if [ -d "db_manage/database/${CURRENT_DB}/tables" ]; then
-                            for tbl_d in db_manage/database/${CURRENT_DB}/tables/*; do
-                                [ -d "$tbl_d" ] && tbl_count=$(expr "$tbl_count" + 1)
-                            done
-                        fi
-
-                        if [ "$tbl_count" -eq 0 ]; then
-                            printf '%b' "${RED}Error: No tables exist in database '$CURRENT_DB'.${NC}\n"
-                        else
-                            printf '%b' "${CYAN}${BOLD}Tables in database '$CURRENT_DB':${NC}\n"
-                            python3 -c '
-import glob, os, sys
-db = sys.argv[1]
-tbls = [os.path.basename(f) for f in glob.glob(f"db_manage/database/{db}/tables/*") if os.path.isdir(f)]
-max_len = max(len(t) for t in tbls) if tbls else 10
-max_len = max(max_len, 15)
-title_plain = "TABLES"
-title_colored = f"\033[1;36m{title_plain:<{max_len}}\033[0m"
-print("┌" + "─" * (max_len + 4) + "┐")
-print(f"│ {title_colored} │")
-print("├" + "─" * (max_len + 4) + "┤")
-for t in tbls:
-    t_padded = f"{t:<{max_len}}"
-    print(f"│ {t_padded} │")
-print("└" + "─" * (max_len + 4) + "┘")
-' "$CURRENT_DB"
-                        fi
-                    fi
-                fi
-                echo ""
-                ;;
-            "insert_into")
-                if [ "$CURRENT_DB" = "none" ]; then
-                    printf '%b' "${RED}Error: No active database. Use 'use <name>' first.${NC}\n"
-                else
-                    OLD_IFS="$IFS"
-                    IFS='&'
-                    set -- $args
-                    IFS="$OLD_IFS"
-                    
-                    for item in "$@"; do
-                        item=$(echo "$item" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                        [ -z "$item" ] && continue
-                        
-                        set -- $item
-                        tblname="$1"
-                        if [ -z "$tblname" ]; then
-                            printf '%b' "${RED}Error: Table name required.${NC}\n"
-                            continue
-                        fi
-                        shift
-                        
-                        tbl_dir="db_manage/database/${CURRENT_DB}/tables/$tblname"
-                        if [ ! -e "$tbl_dir" ]; then
-                            printf '%b' "${RED}Error: Table '$tblname' does not exist.${NC}\n"
-                            continue
-                        fi
-                        
-                        python3 -c '
-import sys, os
-tbl_dir = sys.argv[1]
-args = sys.argv[2:]
-cols_file = os.path.join(tbl_dir, "columns")
-data_file = os.path.join(tbl_dir, "tables")
-if not os.path.exists(cols_file):
-    sys.exit(1)
-with open(cols_file, "r") as f:
-    header = [c.replace("\r", "").strip() for c in f if c.strip()]
-if not header:
-    header = ["id"]
-num_cols = len(header)
-
-lines = []
-if os.path.exists(data_file):
-    with open(data_file, "r") as f:
-        lines = [line.replace("\r", "").strip() for line in f if line.strip()]
-
-rows = []
-for line in lines:
-    parts = [p.strip().replace("\n", " ").replace("\r", "") for p in line.split(" ")]
-    while len(parts) < num_cols:
-        parts.append("")
-    rows.append(parts[:num_cols])
-
-target_map = {}
-if len(args) >= 2 and args[0] in header:
-    i = 0
-    while i < len(args) - 1:
-        col = args[i]
-        val = args[i+1]
-        if col in header and col != "id":
-            target_map[header.index(col)] = str(val).replace("\n", " ").replace("\r", "")
-            i += 2
-        else:
-            i += 1
-elif len(args) == 1 and "|" in args[0]:
-    parts = [p.strip().replace("\n", " ").replace("\r", "") for p in args[0].split("|")]
-    start_idx = 1 if (header and header[0] == "id") else 0
-    for idx, p in enumerate(parts):
-        c_idx = start_idx + idx
-        if c_idx < num_cols:
-            target_map[c_idx] = p
-else:
-    joined = " ".join(args)
-    if "|" in joined:
-        parts = [p.strip().replace("\n", " ").replace("\r", "") for p in joined.split("|")]
-        start_idx = 1 if (header and header[0] == "id") else 0
-        for idx, p in enumerate(parts):
-            c_idx = start_idx + idx
-            if c_idx < num_cols:
-                target_map[c_idx] = p
-    elif len(args) >= 1 and num_cols > 1:
-        if args[0] in header and len(args) >= 2:
-            i = 0
-            while i < len(args) - 1:
-                col = args[i]
-                val = args[i+1]
-                if col in header and col != "id":
-                    target_map[header.index(col)] = str(val).replace("\n", " ").replace("\r", "")
-                    i += 2
-                else:
-                    i += 1
-        else:
-            start_idx = 1 if (header and header[0] == "id") else 0
-            for idx, p in enumerate(args):
-                c_idx = start_idx + idx
-                if c_idx < num_cols:
-                    target_map[c_idx] = str(p).replace("\n", " ").replace("\r", "")
-
-target_row_idx = -1
-if target_map:
-    for r_idx, r in enumerate(rows):
-        is_empty = True
-        for c_idx in target_map:
-            if r[c_idx] != "":
-                is_empty = False
-                break
-        if is_empty:
-            target_row_idx = r_idx
-            break
-
-if target_row_idx != -1:
-    for c_idx, val in target_map.items():
-        rows[target_row_idx][c_idx] = val
-    inserted_row = rows[target_row_idx]
-else:
-    new_row = [""] * num_cols
-    if header and header[0] == "id":
-        new_row[0] = str(len(rows) + 1)
-    for c_idx, val in target_map.items():
-        new_row[c_idx] = val
-    rows.append(new_row)
-    inserted_row = new_row
-
-with open(data_file, "w") as f:
-    for r in rows:
-        f.write(" ".join(r) + "\n")
-
-tbl_name = os.path.basename(tbl_dir)
-inserted_cols = [header[i] for i in target_map.keys()]
-inserted_vals = [target_map[i] for i in target_map.keys()]
-cols_str = ", ".join(inserted_cols) if inserted_cols else ", ".join(header)
-vals_str = ", ".join(inserted_vals) if inserted_vals else ", ".join(inserted_row)
-print(f"\033[0;32mTable '\''{tbl_name}'\'', column '\''{cols_str}'\'': inserted data '\''{vals_str}'\''.\033[0m")
-' "$tbl_dir" "$@"
-                    done
-                fi
-                echo ""
-                ;;
-            "select_from")
-                if [ "$CURRENT_DB" = "none" ]; then
-                    printf '%b' "${RED}Error: No active database. Use 'use <name>' first.${NC}\n"
-                elif [ -z "$args" ]; then
-                    printf '%b' "${RED}Error: Table name required. Usage: select_from <table_name>${NC}\n"
-                else
-                    OLD_IFS="$IFS"
-                    IFS='&'
-                    set -- $args
-                    IFS="$OLD_IFS"
-                    for tbl in "$@"; do
-                        tbl=$(echo "$tbl" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                        [ -z "$tbl" ] && continue
-                        tbl_dir="db_manage/database/${CURRENT_DB}/tables/$tbl"
-                        if [ -e "$tbl_dir" ]; then
-                            printf '%b' "${CYAN}${BOLD}Records from table '$tbl':${NC}\n"
-                            print_professional_table "$tbl_dir"
-                        else
-                            printf '%b' "${RED}Error: Table '$tbl' does not exist.${NC}\n"
-                        fi
-                    done
-                fi
-                echo ""
-                ;;
-            "update")
-                if [ "$CURRENT_DB" = "none" ]; then
-                    printf '%b' "${RED}Error: No active database. Use 'use <name>' first.${NC}\n"
-                else
-                    OLD_IFS="$IFS"
-                    IFS='&'
-                    set -- $args
-                    IFS="$OLD_IFS"
-                    tbl_name="$1"
-                    col_name="$2"
-                    content="$3"
-                    newcontent="$4"
-                    tbl_name=$(echo "$tbl_name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                    col_name=$(echo "$col_name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                    content=$(echo "$content" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                    newcontent=$(echo "$newcontent" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                    if [ -z "$tbl_name" ] || [ -z "$col_name" ] || [ -z "$content" ] || [ -z "$newcontent" ]; then
-                        printf '%b' "${RED}Error: Usage: update <tbl> <col> <val> <newval>${NC}\n"
-                    elif [ ! -e "db_manage/database/${CURRENT_DB}/tables/$tbl_name" ]; then
-                        printf '%b' "${RED}Error: Table '$tbl_name' does not exist.${NC}\n"
-                    else
-                        tbl_dir="db_manage/database/${CURRENT_DB}/tables/$tbl_name"
-                        cols_file="$tbl_dir/columns"
-                        data_file="$tbl_dir/tables"
-                        
-                        col_idx=-1
-                        curr_idx=1
-                        while IFS= read -r col || [ -n "$col" ]; do
-                            col=$(echo "$col" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/\r//g')
-                            [ -z "$col" ] && continue
-                            if [ "$col" = "$col_name" ]; then
-                                col_idx="$curr_idx"
-                                break
-                            fi
-                            curr_idx=$(expr "$curr_idx" + 1)
-                        done < "$cols_file"
-                        
-                        if [ "$col_idx" -eq -1 ]; then
-                            printf '%b' "${RED}Error: Column '$col_name' does not exist.${NC}\n"
-                        else
-                            tmp_file="$data_file.tmp"
-                            updated_count=0
-                            while IFS= read -r line || [ -n "$line" ]; do
-                                row_line=$(echo "$line" | tr -d '\r')
-                                row_idx=1
-                                new_row=""
-                                OLD_IFS2="$IFS"
-                                IFS=' '
-                                set -- $row_line
-                                IFS="$OLD_IFS2"
-                                for val in "$@"; do
-                                    val_trimmed=$(echo "$val" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                                    if [ "$row_idx" -eq "$col_idx" ] && [ "$val_trimmed" = "$content" ]; then
-                                        val_clean=$(echo "$newcontent" | tr '\n' ' ' | tr '\r' ' ' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                                        updated_count=$(expr "$updated_count" + 1)
-                                    else
-                                        val_clean="$val_trimmed"
-                                    fi
-                                    if [ -z "$new_row" ]; then
-                                        new_row="$val_clean"
-                                    else
-                                        new_row="$new_row $val_clean"
-                                    fi
-                                    row_idx=$(expr "$row_idx" + 1)
-                                done
-                                echo "$new_row" >> "$tmp_file"
-                            done < "$data_file"
-                            mv "$tmp_file" "$data_file"
-                            printf '%b' "${GREEN}Updated $updated_count record(s).${NC}\n"
-                        fi
-                    fi
-                fi
-                echo ""
-                ;;
-            "delete_from")
-                if [ "$CURRENT_DB" = "none" ]; then
-                    printf '%b' "${RED}Error: No active database. Use 'use <name>' first.${NC}\n"
-                elif [ -z "$args" ]; then
-                    printf '%b' "${RED}Error: Table name required. Usage: delete_from <tbl>${NC}\n"
-                else
-                    OLD_IFS="$IFS"
-                    IFS='&'
-                    set -- $args
-                    IFS="$OLD_IFS"
-                    for tbl in "$@"; do
-                        tbl=$(echo "$tbl" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                        [ -z "$tbl" ] && continue
-                        tbl_dir="db_manage/database/${CURRENT_DB}/tables/$tbl"
-                        data_file="$tbl_dir/tables"
-                        if [ -e "$tbl_dir" ]; then
-                            > "$data_file"
-                            printf '%b' "${GREEN}All records deleted from table '$tbl'.${NC}\n"
-                        else
-                            printf '%b' "${RED}Error: Table '$tbl' does not exist.${NC}\n"
-                        fi
-                    done
-                fi
-                echo ""
-                ;;
-            "delete_record")
-                if [ "$CURRENT_DB" = "none" ]; then
-                    printf '%b' "${RED}Error: No active database. Use 'use <name>' first.${NC}\n"
-                else
-                    OLD_IFS="$IFS"
-                    IFS='&'
-                    set -- $args
-                    IFS="$OLD_IFS"
-                    
-                    for item in "$@"; do
-                        item=$(echo "$item" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                        [ -z "$item" ] && continue
-                        
-                        set -- $item
-                        tblname="$1"
-                        if [ -z "$tblname" ]; then
-                            printf '%b' "${RED}Error: Table name required.${NC}\n"
-                            continue
-                        fi
-                        shift
-                        param1="$1"
-                        [ $# -gt 0 ] && shift
-                        rest_params="$*"
-                        
-                        tbl_dir="db_manage/database/${CURRENT_DB}/tables/$tblname"
-                        cols_file="$tbl_dir/columns"
-                        data_file="$tbl_dir/tables"
-                        if [ ! -e "$tbl_dir" ]; then
-                            printf '%b' "${RED}Error: Table '$tblname' does not exist.${NC}\n"
-                            continue
-                        fi
-                        
-                        if [ -n "$rest_params" ]; then
-                            col_name="$param1"
-                            target_val="$rest_params"
-                            col_idx=-1
-                            curr_idx=1
-                            while IFS= read -r col || [ -n "$col" ]; do
-                                col=$(echo "$col" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/\r//g')
-                                [ -z "$col" ] && continue
-                                if [ "$col" = "$col_name" ]; then
-                                    col_idx="$curr_idx"
-                                    break
-                                fi
-                                curr_idx=$(expr "$curr_idx" + 1)
-                            done < "$cols_file"
-                            
-                            if [ "$col_idx" -eq -1 ]; then
-                                printf '%b' "${RED}Error: Column '$col_name' does not exist.${NC}\n"
-                            else
-                                tmp_file="$data_file.tmp"
-                                found=0
-                                while IFS= read -r row || [ -n "$row" ]; do
-                                    row=$(echo "$row" | tr -d '\r')
-                                    row_idx=1
-                                    match=0
-                                    OLD_IFS2="$IFS"
-                                    IFS=' '
-                                    set -- $row
-                                    IFS="$OLD_IFS2"
-                                    for val in "$@"; do
-                                        val_trimmed=$(echo "$val" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                                        if [ "$row_idx" -eq "$col_idx" ] && [ "$val_trimmed" = "$target_val" ]; then
-                                            match=1
-                                            break
-                                        fi
-                                        row_idx=$(expr "$row_idx" + 1)
-                                    done
-                                    
-                                    if [ "$match" -eq 1 ]; then
-                                        found=1
-                                    else
-                                        echo "$row" >> "$tmp_file"
-                                    fi
-                                done < "$data_file"
-                                
-                                [ -f "$tmp_file" ] && mv "$tmp_file" "$data_file"
-                                
-                                if [ "$found" -eq 1 ]; then
-                                    printf '%b' "${GREEN}Record where '$col_name' = '$target_val' deleted successfully.${NC}\n"
-                                else
-                                    printf '%b' "${RED}Error: Record not found in column '$col_name'.${NC}\n"
-                                fi
-                            fi
-                        else
-                            target="$param1"
-                            if [ -z "$target" ]; then
-                                printf '%b' "${RED}Error: Value required.${NC}\n"
-                            else
-                                tmp_file="$data_file.tmp"
-                                found=0
-                                while IFS= read -r row || [ -n "$row" ]; do
-                                    row=$(echo "$row" | tr -d '\r')
-                                    if [ "$row" = "$target" ]; then
-                                        found=1
-                                    else
-                                        echo "$row" >> "$tmp_file"
-                                    fi
-                                done < "$data_file"
-                                
-                                [ -f "$tmp_file" ] && mv "$tmp_file" "$data_file"
-
-                                if [ "$found" -eq 1 ]; then
-                                    printf '%b' "${GREEN}Record '$target' deleted successfully.${NC}\n"
-                                else
-                                    printf '%b' "${RED}Error: Record '$target' not found.${NC}\n"
-                                fi
-                            fi
-                        fi
-                    done
-                fi
-                echo ""
-                ;;
-            "api_permissions")
-                if [ "$CURRENT_DB" = "none" ]; then
-                    printf '%b' "${RED}Error: No active database. Use 'use <name>' first.${NC}\n"
-                else
-                    perm_file="db_manage/database/${CURRENT_DB}/api/public/permissions.cfg"
-                    init_permissions_file "$perm_file"
-
-                    args_clean=$(echo "$args" | tr '&' ' ')
-                    set -- $args_clean
-                    p_name="$1"
-                    p_val="$2"
-                    p_name=$(echo "$p_name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                    p_val=$(echo "$p_val" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-
-                    if [ -z "$p_name" ]; then
-                        printf '%b' "${CYAN}${BOLD}Public API Permissions for '$CURRENT_DB':${NC}\n"
-                        while IFS='=' read -r k v || [ -n "$k" ]; do
-                            [ -n "$k" ] && printf '%b' "  - ${CYAN}$k${NC}: ${YELLOW}$v${NC}\n"
-                        done < "$perm_file"
-                    elif [ -n "$p_name" ] && [ -z "$p_val" ]; then
-                        printf '%b' "${RED}Error: Missing permission value. Usage: api_permissions <permission_name> <true|false>${NC}\n"
-                    elif [ "$p_val" != "true" ] && [ "$p_val" != "false" ]; then
-                        printf '%b' "${RED}Error: Invalid value '$p_val'. Permission value must be explicitly set to 'true' or 'false'.${NC}\n"
-                    else
-                        temp_f="$perm_file.tmp"
-                        rm -f "$temp_f"
-                        found_p=0
-                        while IFS='=' read -r k v || [ -n "$k" ]; do
-                            k_clean=$(echo "$k" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/\r//g')
-                            v_clean=$(echo "$v" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/\r//g')
-                            if [ "$k_clean" = "$p_name" ]; then
-                                echo "$k_clean=$p_val" >> "$temp_f"
-                                found_p=1
-                            else
-                                [ -n "$k_clean" ] && echo "$k_clean=$v_clean" >> "$temp_f"
-                            fi
-                        done < "$perm_file"
-
-                        if [ "$found_p" -eq 1 ]; then
-                            mv "$temp_f" "$perm_file"
-                            printf '%b' "${GREEN}Permission '$p_name' updated successfully to '$p_val'.${NC}\n"
-                        else
-                            rm -f "$temp_f"
-                            printf '%b' "${RED}Error: Permission '$p_name' does not exist in the configuration file.${NC}\n"
-                        fi
-                    fi
-                fi
-                echo ""
-                ;;
-            "api_key_list")
-                printf '%b' "${CYAN}${BOLD}Configured API Secret Keys:${NC}\n"
-                has_keys=0
-                if [ -f "db_manage/secrets/database.cfg" ]; then
-                    while IFS='=' read -r k v || [ -n "$k" ]; do
-                        case "$k" in
-                            secret_key*)
-                                printf '%b' "  - ${CYAN}$k${NC}: $v\n"
-                                has_keys=1
-                                ;;
-                        esac
-                    done < "db_manage/secrets/database.cfg"
-                fi
-                if [ "$has_keys" -eq 0 ]; then
-                    printf '%b' "  (No secret keys found)\n"
-                fi
-                echo ""
-                ;;
-            "api_setup")
-                if [ "$CURRENT_DB" = "none" ]; then
-                    printf '%b' "${RED}Error: No active database. Use 'use <name>' first.${NC}\n"
-                else
-                    OLD_IFS="$IFS"
-                    IFS='&'
-                    set -- $args
-                    IFS="$OLD_IFS"
-                    api_type="$1"
-                    api_type=$(echo "$api_type" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                    [ -z "$api_type" ] && api_type="public"
-                    if [ "$api_type" != "public" ] && [ "$api_type" != "secret" ]; then
-                        printf '%b' "${RED}Error: Invalid API type.${NC}\n"
-                        echo ""
-                        continue
-                    fi
-                    api_type_upper=$(echo "$api_type" | tr '[:lower:]' '[:upper:]')
-
-                    show_banner
-                    printf '%b' "${CYAN}${BOLD}==================================================${NC}\n"
-                    printf '%b' "${CYAN}${BOLD}      API SETUP (${api_type_upper}) FOR: $CURRENT_DB      ${NC}\n"
-                    printf '%b' "${CYAN}${BOLD}==================================================${NC}\n\n"
-                    
-                    printf '%b' "Enter API Name: "
-                    read -r api_name
-                    printf '%b' "Enter Protocol (http or https) [http]: "
-                    read -r api_protocol
-                    [ -z "$api_protocol" ] && api_protocol="http"
-                    printf '%b' "Enter API Address (localhost): "
-                    read -r api_address
-                    [ -z "$api_address" ] && api_address="localhost"
-                    printf '%b' "Enter API Port (8080): "
-                    read -r api_port
-                    [ -z "$api_port" ] && api_port="8080"
-
-                    if ! check_ip_port_in_use "$CURRENT_DB" "$api_type" "$api_address" "$api_port"; then
-                        printf '%b' "${RED}Error: Address '$api_address' and Port '$api_port' are already in use by another API. Please try again inserting a valid port.${NC}\n"
-                        echo ""
-                        continue
-                    fi
-
-                    printf '%b' "Enter API Debug (true or false) [true]: "
-                    read -r api_debug
-                    [ -z "$api_debug" ] && api_debug="true"
-
-                    printf '%b' "\n${YELLOW}Available Secret Keys:${NC}\n"
-                    has_k=0
-                    if [ -f "db_manage/secrets/database.cfg" ]; then
-                        while IFS='=' read -r k v || [ -n "$k" ]; do
-                            case "$k" in
-                                secret_key*)
-                                    printf '%b' "  - ${CYAN}$k${NC}: $v\n"
-                                    has_k=1
-                                    ;;
-                            esac
-                        done < "db_manage/secrets/database.cfg"
-                    fi
-                    if [ "$has_k" -eq 0 ]; then
-                        printf '%b' "  (No secret keys found)\n"
-                    fi
-
-                    printf '%b' "\nEnter Secret Key to use [default_secret]: "
-                    read -r resolved_secret
-                    [ -z "$resolved_secret" ] && resolved_secret="default_secret"
-
-                    api_dir="db_manage/database/${CURRENT_DB}/api/$api_type"
-                    mkdir -p "$api_dir"
-                    
-                    cat << EOF > "$api_dir/api.cfg"
-Name=$api_name
-Protocol=$api_protocol
-Address=$api_address
-Port=$api_port
-ApiDebug=$api_debug
-SecretKey=$resolved_secret
-EOF
-                    generate_server_script "$api_dir/server.py"
-                    [ "$api_type" = "public" ] && init_permissions_file "$api_dir/permissions.cfg"
-                    printf '%b' "\n${GREEN}API setup completed successfully.${NC}\n"
-                fi
-                echo ""
-                ;;
-            "api_edit")
-                if [ "$CURRENT_DB" = "none" ]; then
-                    printf '%b' "${RED}Error: No active database. Use 'use <name>' first.${NC}\n"
-                else
-                    OLD_IFS="$IFS"
-                    IFS='&'
-                    set -- $args
-                    IFS="$OLD_IFS"
-                    api_type="$1"
-                    api_type=$(echo "$api_type" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                    [ -z "$api_type" ] && api_type="public"
-                    if [ "$api_type" != "public" ] && [ "$api_type" != "secret" ]; then
-                        printf '%b' "${RED}Error: Invalid API type.${NC}\n"
-                        echo ""
-                        continue
-                    fi
-
-                    api_dir="db_manage/database/${CURRENT_DB}/api/$api_type"
-                    api_cfg="$api_dir/api.cfg"
-
-                    curr_name=""
-                    curr_proto="http"
-                    curr_addr="localhost"
-                    curr_port="8080"
-                    curr_debug="true"
-                    curr_secret="default_secret"
-                    if [ -f "$api_cfg" ]; then
-                        while IFS='=' read -r key val || [ -n "$key" ]; do
-                            case "$key" in
-                                Name) curr_name="$val" ;;
-                                Protocol) curr_proto="$val" ;;
-                                Address) curr_addr="$val" ;;
-                                Port) curr_port="$val" ;;
-                                ApiDebug) curr_debug="$val" ;;
-                                SecretKey) curr_secret="$val" ;;
-                            esac
-                        done < "$api_cfg"
-                    fi
-
-                    show_banner
-                    printf '%b' "Enter new Name [$curr_name]: "
-                    read -r new_name
-                    [ -n "$new_name" ] && curr_name="$new_name"
-
-                    printf '%b' "Enter new Protocol [$curr_proto]: "
-                    read -r new_proto
-                    [ -n "$new_proto" ] && curr_proto="$new_proto"
-
-                    printf '%b' "Enter new Address [$curr_addr]: "
-                    read -r new_addr
-                    [ -n "$new_addr" ] && curr_addr="$new_addr"
-
-                    printf '%b' "Enter new Port [$curr_port]: "
-                    read -r new_port
-                    [ -n "$new_port" ] && curr_port="$new_port"
-
-                    if ! check_ip_port_in_use "$CURRENT_DB" "$api_type" "$curr_addr" "$curr_port"; then
-                        printf '%b' "${RED}Error: Address '$curr_addr' and Port '$curr_port' are already in use by another API. Please try again inserting a valid port.${NC}\n"
-                        echo ""
-                        continue
-                    fi
-
-                    printf '%b' "Enter new API Debug [$curr_debug]: "
-                    read -r new_debug
-                    [ -n "$new_debug" ] && curr_debug="$new_debug"
-
-                    printf '%b' "\n${YELLOW}Available Secret Keys:${NC}\n"
-                    has_k=0
-                    if [ -f "db_manage/secrets/database.cfg" ]; then
-                        while IFS='=' read -r k v || [ -n "$k" ]; do
-                            case "$k" in
-                                secret_key*)
-                                    printf '%b' "  - ${CYAN}$k${NC}: $v\n"
-                                    has_k=1
-                                    ;;
-                            esac
-                        done < "db_manage/secrets/database.cfg"
-                    fi
-                    if [ "$has_k" -eq 0 ]; then
-                        printf '%b' "  (No secret keys found)\n"
-                    fi
-
-                    printf '%b' "\nEnter new Secret Key [$curr_secret]: "
-                    read -r new_secret
-                    [ -n "$new_secret" ] && curr_secret="$new_secret"
-
-                    mkdir -p "$api_dir"
-                    cat << EOF > "$api_cfg"
-Name=$curr_name
-Protocol=$curr_proto
-Address=$curr_addr
-Port=$curr_port
-ApiDebug=$curr_debug
-SecretKey=$curr_secret
-EOF
-                    generate_server_script "$api_dir/server.py"
-                    [ "$api_type" = "public" ] && init_permissions_file "$api_dir/permissions.cfg"
-                    printf '%b' "\n${GREEN}API configuration updated successfully!${NC}\n"
-                fi
-                echo ""
-                ;;
-            "api_start")
-                if [ "$CURRENT_DB" = "none" ]; then
-                    printf '%b' "${RED}Error: No active database. Use 'use <name>' first.${NC}\n"
-                else
-                    args_clean=$(echo "$args" | tr '&' ' ')
-                    set -- $args_clean
-                    api_type="$1"
-                    api_type=$(echo "$api_type" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                    [ -z "$api_type" ] && api_type="public"
-                    if [ "$api_type" != "public" ] && [ "$api_type" != "secret" ]; then
-                        printf '%b' "${RED}Error: Invalid API type. Use 'public' or 'secret'.${NC}\n"
-                        echo ""
-                        continue
-                    fi
-
-                    api_dir="db_manage/database/${CURRENT_DB}/api/$api_type"
-                    api_cfg="$api_dir/api.cfg"
-                    pid_file="$api_dir/api.pid"
-                    server_script="$api_dir/server.py"
-
-                    if [ ! -f "$api_cfg" ]; then
-                        printf '%b' "${RED}Error: API ($api_type) is not configured.${NC}\n"
-                    elif [ -f "$pid_file" ] && kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null; then
-                        printf '%b' "${YELLOW}Error: API ($api_type) server is already running (PID: $(cat "$pid_file")).${NC}\n"
-                    else
-                        [ ! -f "$server_script" ] && generate_server_script "$server_script"
-                        [ "$api_type" = "public" ] && init_permissions_file "$api_dir/permissions.cfg"
-
-                        api_name_val=$(grep "^Name=" "$api_cfg" 2>/dev/null | cut -d'=' -f2 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                        api_proto_val=$(grep "^Protocol=" "$api_cfg" 2>/dev/null | cut -d'=' -f2 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                        api_addr_val=$(grep "^Address=" "$api_cfg" 2>/dev/null | cut -d'=' -f2 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                        api_port_val=$(grep "^Port=" "$api_cfg" 2>/dev/null | cut -d'=' -f2 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                        api_debug_val=$(grep "^ApiDebug=" "$api_cfg" 2>/dev/null | cut -d'=' -f2 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                        api_secret_val=$(grep "^SecretKey=" "$api_cfg" 2>/dev/null | cut -d'=' -f2 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                        
-                        proto="${api_proto_val:-http}"
-                        addr="${api_addr_val:-localhost}"
-                        port="${api_port_val:-8080}"
-                        debug="${api_debug_val:-true}"
-
-                        if python3 -c "import socket; s = socket.socket(); s.settimeout(0.5); exit(0 if s.connect_ex(('$addr', $port)) == 0 else 1)" 2>/dev/null; then
-                            printf '%b' "${RED}Error: Address '$addr' and Port '$port' are already in use on the system.${NC}\n"
-                            echo ""
-                            continue
-                        fi
-
-                        if ! check_ip_port_in_use "$CURRENT_DB" "$api_type" "$addr" "$port"; then
-                            printf '%b' "${RED}Error: Address '$addr' and Port '$port' are already in use by another API. Please try again inserting a valid port.${NC}\n"
-                            echo ""
-                            continue
-                        fi
-
-                        cert_arg=""
-                        key_arg=""
-                        if [ "$proto" = "https" ]; then
-                            if [ ! -f "$api_dir/server.pem" ]; then
-                                openssl req -x509 -newkey rsa:2048 -keyout "$api_dir/server.key" -out "$api_dir/server.crt" -days 365 -nodes -subj "/CN=localhost" 2>/dev/null
-                                cat "$api_dir/server.crt" "$api_dir/server.key" > "$api_dir/server.pem"
-                            fi
-                            cert_arg="$api_dir/server.pem"
-                            key_arg="$api_dir/server.key"
-                        fi
-
-                        API_PORT="$port" API_SECRET="${api_secret_val:-default_secret}" DB_NAME="$CURRENT_DB" API_PROTOCOL="$proto" API_TYPE="$api_type" API_DEBUG="$debug" API_CERT="$cert_arg" API_KEY="$key_arg" python3 "$server_script" > "$api_dir/server.log" 2>&1 &
-                        server_pid=$!
-                        sleep 0.5
-                        if kill -0 "$server_pid" 2>/dev/null; then
-                            echo "$server_pid" > "$pid_file"
-                            printf '%b' "${GREEN}API ($api_type) server started successfully on port ${port} (PID: ${server_pid})!${NC}\n"
-                        else
-                            rm -f "$pid_file"
-                            printf '%b' "${RED}Error: Failed to start API ($api_type) server. Check log at '$api_dir/server.log'.${NC}\n"
-                        fi
-                    fi
-                fi
-                echo ""
-                ;;
-            "api_stop")
-                if [ "$CURRENT_DB" = "none" ]; then
-                    printf '%b' "${RED}Error: No active database. Use 'use <name>' first.${NC}\n"
-                else
-                    args_clean=$(echo "$args" | tr '&' ' ')
-                    set -- $args_clean
-                    api_type="$1"
-                    api_type=$(echo "$api_type" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                    [ -z "$api_type" ] && api_type="public"
-                    
-                    if [ "$api_type" != "public" ] && [ "$api_type" != "secret" ]; then
-                        printf '%b' "${RED}Error: Invalid API type. Use 'public' or 'secret'.${NC}\n"
-                    else
-                        api_dir="db_manage/database/${CURRENT_DB}/api/$api_type"
-                        pid_file="$api_dir/api.pid"
-
-                        if [ ! -f "$pid_file" ]; then
-                            printf '%b' "${YELLOW}API ($api_type) is not currently running.${NC}\n"
-                        else
-                            pid=$(cat "$pid_file" 2>/dev/null)
-                            if [ -n "$pid" ] && kill "$pid" 2>/dev/null; then
-                                printf '%b' "${GREEN}API ($api_type) server stopped successfully.${NC}\n"
-                            else
-                                printf '%b' "${RED}Error: Failed to stop API ($api_type) server or process not running.${NC}\n"
-                            fi
-                            rm -f "$pid_file"
-                        fi
-                    fi
-                fi
-                echo ""
-                ;;
-            "api_delete")
-                if [ "$CURRENT_DB" = "none" ]; then
-                    printf '%b' "${RED}Error: No active database. Use 'use <name>' first.${NC}\n"
-                else
-                    args_clean=$(echo "$args" | tr '&' ' ')
-                    set -- $args_clean
-                    api_type="$1"
-                    api_type=$(echo "$api_type" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                    [ -z "$api_type" ] && api_type="public"
-                    if [ "$api_type" != "public" ] && [ "$api_type" != "secret" ]; then
-                        printf '%b' "${RED}Error: Invalid API type. Use 'public' or 'secret'.${NC}\n"
-                        echo ""
-                        continue
-                    fi
-
-                    api_dir="db_manage/database/${CURRENT_DB}/api/$api_type"
-                    if [ ! -d "$api_dir" ] || [ ! -f "$api_dir/api.cfg" ]; then
-                        printf '%b' "${RED}Error: API ($api_type) does not exist.${NC}\n"
-                    else
-                        pid_file="$api_dir/api.pid"
-                        if [ -f "$pid_file" ]; then
-                            pid=$(cat "$pid_file" 2>/dev/null)
-                            [ -n "$pid" ] && kill "$pid" 2>/dev/null
-                            rm -f "$pid_file"
-                        fi
-                        rm -rf "$api_dir"
-                        printf '%b' "${GREEN}API ($api_type) deleted successfully.${NC}\n"
-                    fi
-                fi
-                echo ""
-                ;;
-            "api_status")
-                if [ "$CURRENT_DB" = "none" ]; then
-                    printf '%b' "${RED}Error: No active database. Use 'use <name>' first.${NC}\n"
-                else
-                    args_clean=$(echo "$args" | tr '&' ' ')
-                    set -- $args_clean
-                    api_type="$1"
-                    api_type=$(echo "$api_type" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                    [ -z "$api_type" ] && api_type="public"
-
-                    if [ "$api_type" != "public" ] && [ "$api_type" != "secret" ]; then
-                        printf '%b' "${RED}Error: Invalid API type. Use 'public' or 'secret'.${NC}\n"
-                    else
-                        api_dir="db_manage/database/${CURRENT_DB}/api/$api_type"
-                        api_cfg="$api_dir/api.cfg"
-                        pid_file="$api_dir/api.pid"
-
-                        if [ ! -f "$pid_file" ] || ! kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null; then
-                            printf '%b' "${RED}Error: API ($api_type) server is not running.${NC}\n"
-                        else
-                            running_pid=$(cat "$pid_file" 2>/dev/null)
-                            api_name=""
-                            api_proto=""
-                            api_addr=""
-                            api_port=""
-                            api_debug=""
-
-                            if [ -f "$api_cfg" ]; then
-                                while IFS='=' read -r key val || [ -n "$key" ]; do
-                                    key_clean=$(echo "$key" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/\r//g')
-                                    val_clean=$(echo "$val" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/\r//g')
-                                    case "$key_clean" in
-                                        Name) api_name="$val_clean" ;;
-                                        Protocol) api_proto="$val_clean" ;;
-                                        Address) api_addr="$val_clean" ;;
-                                        Port) api_port="$val_clean" ;;
-                                        ApiDebug) api_debug="$val_clean" ;;
-                                    esac
-                                done < "$api_cfg"
-                            fi
-
-                            api_type_upper=$(echo "$api_type" | tr '[:lower:]' '[:upper:]')
-                            printf '%b' "${CYAN}${BOLD}==================================================${NC}\n"
-                            printf '%b' "${CYAN}${BOLD}       API SERVER STATUS (${api_type_upper})       ${NC}\n"
-                            printf '%b' "${CYAN}${BOLD}==================================================${NC}\n"
-                            printf '%b' "  ${BOLD}Name:${NC}          ${YELLOW}${api_name}${NC}\n"
-                            printf '%b' "  ${BOLD}Type:${NC}          ${YELLOW}${api_type_upper}${NC}\n"
-                            printf '%b' "  ${BOLD}Status:${NC}        ${GREEN}Running${NC}\n"
-                            printf '%b' "  ${BOLD}PID:${NC}           ${GREEN}${running_pid}${NC}\n"
-                            printf '%b' "  ${BOLD}Protocol:${NC}      ${YELLOW}${api_proto}${NC}\n"
-                            printf '%b' "  ${BOLD}Address:${NC}       ${YELLOW}${api_addr}${NC}\n"
-                            printf '%b' "  ${BOLD}Port:${NC}          ${YELLOW}${api_port}${NC}\n"
-                            printf '%b' "  ${BOLD}Debug:${NC}         ${YELLOW}${api_debug}${NC}\n"
-                            printf '%b' "${CYAN}==================================================${NC}\n"
-                        fi
-                    fi
-                fi
-                echo ""
-                ;;
-            "api_key_add")
-                args_clean=$(echo "$args" | tr '&' ' ')
-                set -- $args_clean
-                new_key="$1"
-                new_key=$(echo "$new_key" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                if [ -z "$new_key" ]; then
-                    printf '%b' "${RED}Error: Secret key required. Usage: api_key_add <key>${NC}\n"
-                else
-                    cfg_file="db_manage/secrets/database.cfg"
-                    [ -f "$cfg_file" ] || touch "$cfg_file"
-                    already_exists=0
-                    while IFS='=' read -r k v || [ -n "$k" ]; do
-                        k_clean=$(echo "$k" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/\r//g')
-                        v_clean=$(echo "$v" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/\r//g')
-                        if [ "$k_clean" = "$new_key" ] || [ "$v_clean" = "$new_key" ]; then
-                            already_exists=1
-                            break
-                        fi
-                    done < "$cfg_file"
-
-                    if [ "$already_exists" -eq 1 ]; then
-                        printf '%b' "${RED}Error: Secret key '$new_key' already exists.${NC}\n"
-                    else
-                        key_count=1
-                        while grep -q "^secret_key_${key_count}=" "$cfg_file" 2>/dev/null; do
-                            key_count=$(expr "$key_count" + 1)
-                        done
-                        echo "secret_key_${key_count}=$new_key" >> "$cfg_file"
-                        printf '%b' "${GREEN}Secret key added successfully as secret_key_${key_count}.${NC}\n"
-                    fi
-                fi
-                echo ""
-                ;;
-            "api_key_remove")
-                OLD_IFS="$IFS"
-                IFS='&'
-                set -- $args
-                IFS="$OLD_IFS"
-                rem_key="$1"
-                rem_key=$(echo "$rem_key" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                if [ -z "$rem_key" ]; then
-                    printf '%b' "${RED}Error: Secret key required. Usage: api_key_remove <key>${NC}\n"
-                else
-                    cfg_file="db_manage/secrets/database.cfg"
-                    temp_f="$cfg_file.tmp"
-                    found_k=0
-                    while IFS='=' read -r k v || [ -n "$k" ]; do
-                        if [ "$k" = "$rem_key" ] || [ "$v" = "$rem_key" ]; then
-                            found_k=1
-                        else
-                            [ -n "$k" ] && echo "$k=$v" >> "$temp_f"
-                        fi
-                    done < "$cfg_file"
-                    [ -f "$temp_f" ] && mv "$temp_f" "$cfg_file"
-                    if [ "$found_k" -eq 1 ]; then
-                        printf '%b' "${GREEN}Secret key '$rem_key' removed successfully.${NC}\n"
-                    else
-                        printf '%b' "${RED}Error: Secret key '$rem_key' not found.${NC}\n"
-                    fi
-                fi
-                echo ""
-                ;;
-            "api_request")
-                if [ "$CURRENT_DB" = "none" ]; then
-                    printf '%b' "${RED}Error: No active database. Use 'use <name>' first.${NC}\n"
-                else
-                    args_clean=$(echo "$args" | tr '&' ' ')
-                    set -- $args_clean
-                    api_type="$1"
-                    shift
-                    req_cmd="$*"
-                    api_type=$(echo "$api_type" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                    req_cmd=$(echo "$req_cmd" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                    if [ -z "$api_type" ] || [ -z "$req_cmd" ]; then
-                        printf '%b' "${RED}Error: Usage: api_request <public|secret> <cmd>${NC}\n"
-                    elif [ "$api_type" != "public" ] && [ "$api_type" != "secret" ]; then
-                        printf '%b' "${RED}Error: Invalid API type. Use 'public' or 'secret'.${NC}\n"
-                    else
-                        api_dir="db_manage/database/${CURRENT_DB}/api/$api_type"
-                        api_cfg="$api_dir/api.cfg"
-                        pid_file="$api_dir/api.pid"
-                        if [ ! -f "$api_cfg" ]; then
-                            printf '%b' "${RED}Error: API ($api_type) is not configured.${NC}\n"
-                        elif [ ! -f "$pid_file" ] || ! kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null; then
-                            printf '%b' "${RED}Error: API ($api_type) server is not running.${NC}\n"
-                        else
-                            port=$(grep "^Port=" "$api_cfg" 2>/dev/null | cut -d'=' -f2 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                            proto=$(grep "^Protocol=" "$api_cfg" 2>/dev/null | cut -d'=' -f2 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                            sec_key=$(grep "^SecretKey=" "$api_cfg" 2>/dev/null | cut -d'=' -f2 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                            [ -z "$port" ] && port="8080"
-                            [ -z "$proto" ] && proto="http"
-                            endpoint=$(echo "$req_cmd" | tr ' ' '/')
-                            curl -s -k -H "X-Secret-Key: $sec_key" "${proto}://localhost:${port}/${endpoint}"
-                            echo ""
-                        fi
-                    fi
-                fi
-                echo ""
                 ;;
             *)
-                printf '%b' "${RED}Unknown command: '$command'. Type 'help' for available commands.${NC}\n"
-                echo ""
+                _dbm_python "$CURRENT_DB" "$command" "$args"
+                _rc=$?
+                if [ "$_rc" -eq 2 ]; then
+                    printf '%b\n' "${RED}Unknown command: '$command'. Type 'help' for available commands.${NC}"
+                fi
                 ;;
         esac
     done
 done
+
+# The following here-document is a protected payload: it is Python source code,
+# not a second file. _dbm_python extracts it from this .sh file at run time.
+: <<'__DB_MANAGER_PYTHON_PAYLOAD__'
+#__DBM_PYTHON_BEGIN__
+#!/usr/bin/env python3
+"""Extension layer for the existing Custom DB Manager CLI.
+
+This module deliberately handles only the commands that need the requested fixes.
+All other commands continue to be handled by the original Bash CLI.
+"""
+from __future__ import annotations
+import contextlib
+import datetime as dt
+import getpass
+import hashlib
+import html
+import hmac
+import http.server
+import json
+import os
+import pathlib
+import pwd
+import re
+import readline
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tarfile
+import tempfile
+import threading
+import time
+import urllib.parse
+import uuid
+from typing import Any
+
+# The Python implementation is embedded inside the distributed Bash file.
+# Bash passes its absolute path through DB_MANAGER_SCRIPT so API/backup workers
+# can relaunch this same single file without an external Python module.
+SHELL_SCRIPT = pathlib.Path(os.environ.get("DB_MANAGER_SCRIPT", os.path.abspath(sys.argv[0]))).resolve()
+try:
+    _dbm_tty_in = open("/dev/tty", "r", encoding="utf-8", errors="replace")
+    if _dbm_tty_in.isatty():
+        sys.stdin = _dbm_tty_in
+except OSError:
+    pass
+
+ROOT = pathlib.Path.cwd() / "db_manage"
+DB_ROOT = ROOT / "database"
+RESET = "\033[0m"
+RED = "\033[0;31m"
+GREEN = "\033[0;32m"
+YELLOW = "\033[1;33m"
+CYAN = "\033[0;36m"
+BOLD = "\033[1m"
+
+
+def cprint(text: str, color: str = GREEN) -> None:
+    print(f"{color}{text}{RESET}")
+
+
+def show_cli_banner() -> None:
+    print(f"{CYAN}=================================================={RESET}")
+    print(f"{BOLD}        CUSTOM DB MANAGER CLI - Version 1.0     {RESET}")
+    print(f"{CYAN}=================================================={RESET}")
+    print(f" Type '{YELLOW}help{RESET}' for commands or '{RED}exit{RESET}' to quit.\n")
+
+
+def valid_name(name: str, what: str = "name") -> str:
+    # Preserve the original CLI's support for spaces in database/table names,
+    # while preventing path traversal or control characters.
+    if (not name or name in {".", ".."} or "/" in name or "\x00" in name
+            or len(name.encode("utf-8")) > 200 or any(ord(ch) < 32 for ch in name)):
+        raise ValueError(f"Invalid {what}: path separators and control characters are not allowed.")
+    return name
+
+
+def valid_backup_name(name: str) -> str:
+    if not name or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", name):
+        raise ValueError("Invalid backup name: spaces are not allowed; use letters, numbers, '.', '_' or '-'.")
+    return name
+
+
+def db_dir(db: str) -> pathlib.Path:
+    valid_name(db, "database name")
+    return DB_ROOT / db
+
+
+def dirs(db: str) -> dict[str, pathlib.Path]:
+    base = db_dir(db)
+    return {
+        "base": base,
+        "tables": base / "tables",
+        "api": base / "api",
+        "secrets": base / "secrets",
+        "backups": base / "backups",
+        "history": base / ".cli_history",
+        "backup_cfg": base / "secrets" / "backup_configs.cfg",
+        "schedule_cfg": base / "secrets" / "backup_schedule.cfg",
+        "keys_cfg": base / "secrets" / "database.cfg",
+        "secrets_env": base / "secrets" / "secrets.env",
+    }
+
+
+def migrate_legacy_storage() -> None:
+    """Migrate former global settings into independent per-database copies once."""
+    runtime = ROOT / "runtime"
+    marker = runtime / ".legacy_storage_migrated"
+    if marker.exists():
+        return
+    legacy_secrets = ROOT / "secrets"
+    legacy_backups = ROOT / "backups"
+    runtime.mkdir(parents=True, exist_ok=True)
+    databases = [p for p in DB_ROOT.iterdir() if p.is_dir()] if DB_ROOT.exists() else []
+    if legacy_secrets.exists():
+        # Old global backup daemons must not continue operating on the old layout.
+        for pid_file in legacy_secrets.glob("backup_*.pid"):
+            # Use the same safe identity-aware process-tree termination as the
+            # current service manager; never signal a bare, potentially reused PID.
+            with contextlib.suppress(Exception):
+                stop_pid_file(pid_file)
+        for base in databases:
+            target = base / "secrets"
+            target.mkdir(parents=True, exist_ok=True)
+            for filename in ("secrets.env", "database.cfg", "backup_configs.cfg", "backup_schedule.cfg"):
+                source = legacy_secrets / filename
+                dest = target / filename
+                if source.is_file() and (not dest.exists() or dest.stat().st_size == 0):
+                    shutil.copy2(source, dest)
+                    os.chmod(dest, 0o600)
+            schedule = target / "backup_schedule.cfg"
+            if schedule.exists():
+                # Do not silently start legacy global jobs against a different database.
+                lines = []
+                for line in schedule.read_text(encoding="utf-8", errors="replace").splitlines():
+                    if "=" in line:
+                        name, value = line.split("=", 1)
+                        _, sep, interval = value.partition(":")
+                        lines.append(f"{name}=false:{interval if sep and interval else '1h'}")
+                if lines: schedule.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        archived_name = "pending-global-secrets" if not databases else "legacy-global-secrets"
+        archived = runtime / archived_name
+        if archived.exists(): archived = runtime / f"{archived_name}-{int(time.time())}"
+        with contextlib.suppress(OSError): legacy_secrets.rename(archived)
+    if legacy_backups.exists():
+        archived = runtime / "legacy-global-backups"
+        if archived.exists(): archived = runtime / f"legacy-global-backups-{int(time.time())}"
+        with contextlib.suppress(OSError): legacy_backups.rename(archived)
+    marker.write_text("migrated\n", encoding="utf-8")
+
+
+def write_api_server_stub(db: str, api_type: str, api_dir: pathlib.Path) -> None:
+    path = api_dir / "server.py"
+    content = (
+        "#!/usr/bin/env bash\n"
+        "# DB_MANAGER_EXT_SERVER_STUB\n"
+        f"exec bash {shlex.quote(str(SHELL_SCRIPT))} --db-manager-internal --serve {shlex.quote(db)} {shlex.quote(api_type)}\n"
+    )
+    path.write_text(content, encoding="utf-8")
+    os.chmod(path, 0o700)
+
+
+def write_backup_server_stub(db: str, secrets_dir: pathlib.Path) -> None:
+    path = secrets_dir / "backup_server.py"
+    content = (
+        "#!/usr/bin/env bash\n"
+        "# DB_MANAGER_EXT_BACKUP_STUB\n"
+        f"exec bash {shlex.quote(str(SHELL_SCRIPT))} --db-manager-internal --worker {shlex.quote(db)} \"$1\" \"${{2:-300}}\"\n"
+    )
+    path.write_text(content, encoding="utf-8")
+    os.chmod(path, 0o700)
+
+
+def ensure_db_layout(db: str) -> dict[str, pathlib.Path]:
+    migrate_legacy_storage()
+    d = dirs(db)
+    for key in ("tables", "api", "secrets", "backups"):
+        d[key].mkdir(parents=True, exist_ok=True)
+    pending = ROOT / "runtime" / "pending-global-secrets"
+    if pending.is_dir():
+        for filename in ("secrets.env", "database.cfg", "backup_configs.cfg", "backup_schedule.cfg"):
+            src, dst = pending / filename, d["secrets"] / filename
+            if src.is_file() and (not dst.exists() or dst.stat().st_size == 0):
+                shutil.copy2(src, dst); os.chmod(dst, 0o600)
+        schedule = d["secrets"] / "backup_schedule.cfg"
+        if schedule.exists():
+            safe_lines = []
+            for line in schedule.read_text(encoding="utf-8", errors="replace").splitlines():
+                if "=" in line:
+                    fn, value = line.split("=", 1); _, sep, interval = value.partition(":")
+                    safe_lines.append(f"{fn}=false:{interval if sep and interval else '1h'}")
+            if safe_lines: schedule.write_text("\n".join(safe_lines) + "\n", encoding="utf-8")
+        archived = ROOT / "runtime" / "legacy-global-secrets"
+        if archived.exists(): archived = ROOT / "runtime" / f"legacy-global-secrets-{int(time.time())}"
+        with contextlib.suppress(OSError): pending.rename(archived)
+    write_backup_server_stub(db, d["secrets"])
+    for api_type in ("public", "secret"):
+        api_dir = d["api"] / api_type
+        api_dir.mkdir(parents=True, exist_ok=True)
+        write_api_server_stub(db, api_type, api_dir)
+        if api_type == "public":
+            perm = api_dir / "permissions.cfg"
+            if not perm.exists():
+                perm.write_text(
+                    "show_tables=false\ndump_db=false\nselect_from=false\ninsert_into=false\n"
+                    "create_table=false\ndrop_table=false\ndelete_from=false\ndelete_record=false\n"
+                    "create_column=false\ndrop_column=false\nshow_columns=false\nrename_column=false\n"
+                    "update=false\nrename_table=false\n", encoding="utf-8")
+    if not (d["base"] / f"{db}.db").exists():
+        (d["base"] / f"{db}.db").write_text(
+            json.dumps({"database": db, "tables": {}}, indent=2) + "\n", encoding="utf-8")
+    if not d["backup_cfg"].exists() or d["backup_cfg"].stat().st_size == 0:
+        write_backup_config(d["backup_cfg"], default_backup_config())
+    if not d["schedule_cfg"].exists() or d["schedule_cfg"].stat().st_size == 0:
+        d["schedule_cfg"].write_text("backup=false:1h\nbackup_delete=false:1d\n", encoding="utf-8")
+    if not d["keys_cfg"].exists():
+        d["keys_cfg"].touch(mode=0o600)
+    if not d["secrets_env"].exists():
+        d["secrets_env"].touch(mode=0o600)
+    with contextlib.suppress(OSError):
+        os.chmod(d["secrets"], 0o700)
+        os.chmod(d["keys_cfg"], 0o600)
+        os.chmod(d["secrets_env"], 0o600)
+    return d
+
+
+def default_backup_config() -> dict[str, dict[str, str]]:
+    return {
+        "General": {"default_backup_name": "auto", "auto_compression": "true", "verify_integrity": "false", "backup_storage_path": ""},
+        "Retention": {"max_backups": "10", "auto_cleanup": "false", "keep_daily": "false", "keep_weekly": "false"},
+        "Schedule": {"default_interval": "1h", "background_daemon": "true", "notify_on_completion": "false"},
+        "Security": {"encrypt_backups": "false", "storage_permissions": "700", "sign_manifest": "false"},
+    }
+
+
+def write_backup_config(path: pathlib.Path, cfg: dict[str, dict[str, str]]) -> None:
+    lines = []
+    for section, values in cfg.items():
+        lines.append(f"[{section}]")
+        lines.extend(f"{k}={v}" for k, v in values.items())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def read_backup_config(db: str) -> dict[str, dict[str, str]]:
+    d = ensure_db_layout(db)
+    cfg = default_backup_config()
+    section = None
+    for raw in d["backup_cfg"].read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1]
+            cfg.setdefault(section, {})
+        elif "=" in line and section:
+            k, v = line.split("=", 1)
+            cfg.setdefault(section, {})[k.strip()] = v.strip()
+    return cfg
+
+
+def cfg_value(cfg: dict[str, dict[str, str]], key: str, default: str = "") -> str:
+    for values in cfg.values():
+        if key in values:
+            return values[key]
+    return default
+
+
+def backup_directory(db: str, cfg: dict[str, dict[str, str]] | None = None, create: bool = True) -> pathlib.Path:
+    """Return the per-database backup directory, optionally on another filesystem.
+
+    A configured external path must already exist and reside on a different
+    filesystem from db_manage. This prevents a missing secondary disk from
+    silently becoming an ordinary directory on the primary disk.
+    """
+    d = dirs(db)
+    if cfg is None:
+        cfg = read_backup_config(db)
+    raw = cfg_value(cfg, "backup_storage_path", "").strip()
+    if not raw:
+        target = d["backups"]
+        if create:
+            target.mkdir(parents=True, exist_ok=True)
+        return target
+
+    base = pathlib.Path(raw).expanduser()
+    if not base.is_absolute():
+        raise ValueError("backup_storage_path must be an absolute directory on the secondary disk.")
+    try:
+        base = base.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError(f"Configured backup storage is unavailable: {raw} ({exc}).") from exc
+    if not base.is_dir():
+        raise ValueError("backup_storage_path must point to an existing directory.")
+    try:
+        primary_device = ROOT.resolve().stat().st_dev
+        backup_device = base.stat().st_dev
+    except OSError as exc:
+        raise RuntimeError(f"Cannot verify backup storage filesystem: {exc}") from exc
+    if backup_device == primary_device:
+        raise ValueError("backup_storage_path must be on a different filesystem from the primary db_manage directory.")
+    if not os.access(base, os.W_OK | os.X_OK):
+        raise PermissionError(f"Backup storage directory is not writable: {base}")
+    target = base / valid_name(db, "database name")
+    if create:
+        target.mkdir(parents=True, exist_ok=True)
+        os.chmod(target, 0o700)
+    return target
+
+
+def validate_backup_storage_path(value: str) -> str:
+    value = value.strip()
+    if not value:
+        return ""
+    base = pathlib.Path(value).expanduser()
+    if not base.is_absolute():
+        raise ValueError("backup_storage_path must be an absolute path. Use an empty value to restore local storage.")
+    if not base.exists() or not base.is_dir():
+        raise ValueError("The selected backup_storage_path must already exist and be mounted.")
+    resolved = base.resolve(strict=True)
+    if resolved.stat().st_dev == ROOT.resolve().stat().st_dev:
+        raise ValueError("The selected directory is on the primary filesystem. Choose a directory on the secondary disk.")
+    if not os.access(resolved, os.W_OK | os.X_OK):
+        raise PermissionError(f"The selected directory is not writable: {resolved}")
+    return str(resolved)
+
+
+def migrate_backup_files(old_dir: pathlib.Path, new_dir: pathlib.Path) -> int:
+    """Copy existing backup archives/manifests to the newly selected store."""
+    if old_dir.resolve() == new_dir.resolve():
+        return 0
+    if not old_dir.is_dir():
+        return 0
+    new_dir.mkdir(parents=True, exist_ok=True)
+    copied = 0
+    for item in old_dir.iterdir():
+        if not item.is_file():
+            continue
+        destination = new_dir / item.name
+        if not destination.exists():
+            shutil.copy2(item, destination)
+            copied += 1
+    return copied
+
+
+def parse_interval(value: str) -> int:
+    m = re.fullmatch(r"\s*(\d+)\s*(sec|s|min|m|h|d|w|y)?\s*", value.lower())
+    if not m:
+        raise ValueError("Invalid interval. Use values such as 30sec, 5min, 1h, 1d or 1w.")
+    n = int(m.group(1))
+    unit = m.group(2) or "sec"
+    factors = {"sec": 1, "s": 1, "min": 60, "m": 60, "h": 3600, "d": 86400, "w": 604800, "y": 31536000}
+    if n < 1:
+        raise ValueError("Interval must be greater than zero.")
+    return n * factors[unit]
+
+
+def parse_bool(value: str) -> str:
+    v = value.lower()
+    if v not in ("true", "false"):
+        raise ValueError("Value must be 'true' or 'false'.")
+    return v
+
+
+def key_records(db: str) -> list[tuple[str, str]]:
+    d = ensure_db_layout(db)
+    result = []
+    for line in d["keys_cfg"].read_text(encoding="utf-8", errors="replace").splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            if k.strip().startswith("secret_key_") and v.strip():
+                result.append((k.strip(), v.strip()))
+    return result
+
+
+def write_key_records(db: str, records: list[tuple[str, str]]) -> None:
+    d = ensure_db_layout(db)
+    tmp = d["keys_cfg"].with_suffix(".tmp")
+    tmp.write_text("".join(f"{k}={v}\n" for k, v in records), encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    tmp.replace(d["keys_cfg"])
+
+
+def register_key(db: str, value: str) -> None:
+    if not value or any(ch in value for ch in "\n=/\r"):
+        raise ValueError("API keys cannot contain '/', '=' or line breaks.")
+    records = key_records(db)
+    if any(existing == value for _, existing in records): return
+    idx = 1
+    names = {name for name, _ in records}
+    while f"secret_key_{idx}" in names: idx += 1
+    records.append((f"secret_key_{idx}", value))
+    write_key_records(db, records)
+
+
+def resolve_key(db: str, raw: str) -> str:
+    for name, value in key_records(db):
+        if raw == name:
+            return value
+    return raw
+
+
+def show_keys(db: str) -> None:
+    records = key_records(db)
+    print(f"{CYAN}{BOLD}Configured API Secret Keys ({db}):{RESET}")
+    if not records:
+        print("  (No secret keys found)")
+    for name, value in records:
+        print(f"  - {CYAN}{name}{RESET}: {value}")
+
+
+def api_cfg_path(db: str, api_type: str) -> pathlib.Path:
+    if api_type not in ("public", "secret"):
+        raise ValueError("API type must be 'public' or 'secret'.")
+    return ensure_db_layout(db)["api"] / api_type / "api.cfg"
+
+
+def read_kv(path: pathlib.Path) -> dict[str, str]:
+    data: dict[str, str] = {}
+    if path.exists():
+        for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if "=" in raw:
+                k, v = raw.split("=", 1)
+                data[k.strip()] = v.strip()
+    return data
+
+
+def write_kv(path: pathlib.Path, data: dict[str, str], mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text("".join(f"{k}={v}\n" for k, v in data.items()), encoding="utf-8")
+    os.chmod(tmp, mode)
+    tmp.replace(path)
+
+
+def api_pair(db: str, api_type: str) -> tuple[str, str]:
+    cfg = read_kv(api_cfg_path(db, api_type))
+    k1 = cfg.get("SecretKey1", "")
+    k2 = cfg.get("SecretKey2", "")
+    if not k1 or not k2 or hmac.compare_digest(k1, k2):
+        raise ValueError(f"API ({api_type}) must have two different secret keys configured.")
+    return k1, k2
+
+
+def api_prefix(cfg: dict[str, str]) -> str:
+    name = cfg.get("Name", "api")
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", name.strip()).strip("-._") or "api"
+    return "/customdb/" + urllib.parse.quote(slug, safe="-._")
+
+
+def server_main(db: str, api_type: str) -> None:
+    d = ensure_db_layout(db)
+    cfg_file = api_cfg_path(db, api_type)
+    cfg = read_kv(cfg_file)
+    if not cfg:
+        raise RuntimeError(f"API ({api_type}) is not configured.")
+    key1, key2 = api_pair(db, api_type)
+    port = int(cfg.get("Port", "8080"))
+    address = cfg.get("Address", "localhost") or "localhost"
+    proto = cfg.get("Protocol", "http").lower()
+    debug = cfg.get("ApiDebug", "true").lower() == "true"
+    base_path = api_prefix(cfg)
+    tables_dir = d["tables"]
+    perm_file = d["api"] / "public" / "permissions.cfg"
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        server_version = "CustomDB/1.0"
+
+        def log_message(self, fmt: str, *args: Any) -> None:
+            # Avoid logging query strings: the URL contains the two credentials.
+            sys.stderr.write(f"{self.client_address[0]} - {self.command} request\n")
+
+        def send_json(self, code: int, data: dict[str, Any]) -> None:
+            if debug:
+                if "message" in data:
+                    data["message"] += " - Powered by Afonso Carreira.Inc"
+                else:
+                    data["message"] = "Powered by Afonso Carreira.Inc"
+                data["api_type"] = api_type
+            payload = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def send_html(self, code: int, data: dict[str, Any]) -> None:
+            tables = data.get("tables", [])
+            table_items = "".join(f"<li>📁 &nbsp; {html.escape(str(t))}</li>" for t in tables)
+            if not table_items: table_items = "<li>(No tables found)</li>"
+            footer_html = '<div class="footer">Powered by Afonso Carreira.Inc</div>' if debug else ""
+            type_html = f"<p><strong>API Type:</strong> <code>{html.escape(api_type.upper())}</code></p>" if debug else ""
+            message = html.escape(str(data.get("message", "Database API running successfully!")))
+            payload_data = html.escape(json.dumps(data, indent=2, ensure_ascii=False))
+            html_doc = f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><title>Database API Dashboard</title>
+<style>body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 30px; }}
+.container {{ max-width: 850px; margin: 0 auto; background: #1e293b; padding: 40px; border-radius: 12px; border: 1px solid #334155; }}
+h1 {{ color: #38bdf8; border-bottom: 2px solid #334155; padding-bottom: 12px; }}
+pre {{ background: #0f172a; padding: 20px; border-radius: 8px; overflow-x: auto; color: #38bdf8; border: 1px solid #334155; }}
+ul {{ list-style-type: none; padding: 0; }} li {{ background: #334155; margin: 8px 0; padding: 12px 16px; border-radius: 6px; }}
+.status-box {{ background: #064e3b; border: 1px solid #059669; color: #34d399; padding: 12px 16px; border-radius: 6px; margin-bottom: 20px; }}
+.footer {{ margin-top: 20px; text-align: center; color: #38bdf8; font-weight: bold; }}</style></head>
+<body><div class="container"><h1>Database Server Dashboard <span>{html.escape(db)}</span></h1>
+<div class="status-box">✓ {message}</div>{type_html}<p><strong>Protocol:</strong> <code>{html.escape(proto.upper())}</code></p>
+<h3>Active Database Tables:</h3><ul>{table_items}</ul><h3>Output (JSON):</h3><pre>{payload_data}</pre>{footer_html}
+</div></body></html>"""
+            body = html_doc.encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def permission(self, name: str) -> bool:
+            if api_type == "secret":
+                return True
+            permissions = read_kv(perm_file)
+            return permissions.get(name, "false").lower() == "true"
+
+        def authenticate(self, parsed: urllib.parse.SplitResult) -> bool:
+            values = urllib.parse.parse_qs(parsed.query, keep_blank_values=True).get("key", [])
+            if len(values) != 1 or "/" not in values[0]:
+                return False
+            first, second = values[0].split("/", 1)
+            return hmac.compare_digest(first, key1) and hmac.compare_digest(second, key2)
+
+        def do_GET(self) -> None: self._handle_api("GET")
+        def do_POST(self) -> None: self._handle_api("POST")
+        def do_PUT(self) -> None: self._handle_api("PUT")
+        def do_DELETE(self) -> None: self._handle_api("DELETE")
+
+        def _handle_api(self, method: str) -> None:
+            parsed = urllib.parse.urlsplit(self.path)
+            if not self.authenticate(parsed):
+                self.send_json(401, {"status": "error", "error": "Unauthorized: both API keys are required."})
+                return
+            path = parsed.path
+            if path == base_path or path == base_path + "/":
+                path = "/"
+            elif path.startswith(base_path + "/"):
+                path = path[len(base_path):]
+            else:
+                self.send_json(404, {"status": "error", "error": "Invalid API base path."})
+                return
+            path = path.rstrip("/") or "/"
+            if api_type == "public":
+                now = time.monotonic()
+                recent = getattr(self.server, "requests_by_ip", {})
+                arr = [t for t in recent.get(self.client_address[0], []) if now - t < 5]
+                if len(arr) >= 10:
+                    self.send_json(429, {"status": "error", "error": "Rate limit exceeded."})
+                    return
+                arr.append(now)
+                recent[self.client_address[0]] = arr
+                self.server.requests_by_ip = recent
+            body: dict[str, Any] = {}
+            if method in ("POST", "PUT"):
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                if length > 2_000_000:
+                    self.send_json(413, {"status": "error", "error": "Request body too large."})
+                    return
+                raw = self.rfile.read(length) if length else b""
+                if raw:
+                    try:
+                        body = json.loads(raw.decode("utf-8"))
+                        if not isinstance(body, dict): body = {"data": body}
+                    except Exception:
+                        body = {"raw_body": raw.decode("utf-8", errors="ignore")}
+            query = {k: v[0] if len(v) == 1 else v for k, v in urllib.parse.parse_qs(parsed.query).items() if k != "key"}
+            params = {**query, **body}
+            out: dict[str, Any] = {"status": "success", "database": db, "method": method,
+                                   "endpoint": path, "protocol": proto}
+            code = 200
+            try:
+                if path.startswith(("/api_", "/create_database", "/drop_database", "/show_databases", "/use")):
+                    raise PermissionError(f"API restriction: endpoint '{path}' is prohibited.")
+                if path in ("/", "/status"):
+                    tables = sorted(p.name for p in tables_dir.iterdir() if p.is_dir())
+                    out.update({"message": "Database API running successfully!", "tables": tables,
+                                "base_path": base_path})
+                    accept_header = self.headers.get("Accept", "")
+                    if "text/html" in accept_header or path == "/":
+                        self.send_html(code, out)
+                        return
+                elif path == "/dump_db":
+                    if not self.permission("dump_db"): raise PermissionError("Permission denied for 'dump_db'.")
+                    meta_file = d["base"] / f"{db}.db"
+                    metadata: Any = meta_file.read_text(encoding="utf-8") if meta_file.exists() else ""
+                    with contextlib.suppress(Exception): metadata = json.loads(metadata)
+                    out.update({"message": f"Universal database dump for '{db}'.", "metadata": metadata,
+                                "tables": sorted(p.name for p in tables_dir.iterdir() if p.is_dir())})
+                elif path == "/show_tables":
+                    if not self.permission("show_tables"): raise PermissionError("Permission denied for 'show_tables'.")
+                    out["tables"] = sorted(p.name for p in tables_dir.iterdir() if p.is_dir())
+                elif path.startswith(("/select_from/", "/select/")):
+                    if not self.permission("select_from"): raise PermissionError("Permission denied for 'select_from'.")
+                    table = valid_name(path.rstrip("/").split("/")[-1], "table name")
+                    tdir = tables_dir / table
+                    if not tdir.is_dir(): code = 404; raise FileNotFoundError(f"Table '{table}' does not exist.")
+                    out.update({"table": table,
+                                "records": (tdir / "tables").read_text(encoding="utf-8").splitlines()})
+                elif path.startswith(("/insert_into/", "/insert/")):
+                    if not self.permission("insert_into"): raise PermissionError("Permission denied for 'insert_into'.")
+                    table = valid_name(path.rstrip("/").split("/")[-1], "table name")
+                    tdir = tables_dir / table
+                    if not tdir.is_dir(): code = 404; raise FileNotFoundError(f"Table '{table}' does not exist.")
+                    cols = [x.strip() for x in (tdir / "columns").read_text(encoding="utf-8").splitlines() if x.strip()]
+                    values = params.get("data") or params.get("record") or body.get("raw_body")
+                    if values is None or values == "": raise ValueError("Missing data to insert.")
+                    data_file = tdir / "tables"
+                    lines = data_file.read_text(encoding="utf-8").splitlines() if data_file.exists() else []
+                    rows = []
+                    for line in lines:
+                        parts = [p.strip().replace("\n", " ").replace("\r", "") for p in line.split(" ")]
+                        while len(parts) < len(cols): parts.append("")
+                        rows.append(parts[:len(cols)])
+                    target_map = {}
+                    if isinstance(values, dict):
+                        for k, v in values.items():
+                            if k in cols and k != "id": target_map[cols.index(k)] = str(v).replace("\n", " ").replace("\r", "")
+                    else:
+                        raw = str(values).replace("\n", " ").replace("\r", "")
+                        parts = [p.strip() for p in raw.replace("|", " ").split(" ") if p.strip()]
+                        if parts and parts[0] in cols:
+                            i = 0
+                            while i < len(parts) - 1:
+                                col, val = parts[i], parts[i + 1]
+                                if col in cols and col != "id": target_map[cols.index(col)] = val; i += 2
+                                else: i += 1
+                        else:
+                            start = 1 if cols and cols[0] == "id" else 0
+                            for i, value in enumerate(parts):
+                                if start + i < len(cols): target_map[start + i] = value
+                    target_idx = None
+                    for r_idx, row_values in enumerate(rows):
+                        if target_map and all(row_values[idx] == "" for idx in target_map):
+                            target_idx = r_idx; break
+                    if target_idx is None:
+                        row = [""] * len(cols)
+                        if cols and cols[0] == "id": row[0] = str(len(rows) + 1)
+                        rows.append(row); target_idx = len(rows) - 1
+                    for idx, value in target_map.items(): rows[target_idx][idx] = value
+                    data_file.write_text("".join(" ".join(r) + "\n" for r in rows), encoding="utf-8")
+                    out.update({"message": f"Data successfully inserted into table '{table}'.", "inserted_data": rows[target_idx]})
+                elif path.startswith("/create_table/"):
+                    if not self.permission("create_table"): raise PermissionError("Permission denied for 'create_table'.")
+                    table = valid_name(path.rstrip("/").split("/")[-1], "table name")
+                    tdir = tables_dir / table
+                    if tdir.exists(): code = 409; raise FileExistsError(f"Table '{table}' already exists.")
+                    tdir.mkdir(parents=True); (tdir / "columns").write_text("id\n"); (tdir / "tables").touch()
+                    out["message"] = f"Table '{table}' created successfully."
+                elif path.startswith("/drop_table/"):
+                    if not self.permission("drop_table"): raise PermissionError("Permission denied for 'drop_table'.")
+                    table = valid_name(path.rstrip("/").split("/")[-1], "table name")
+                    tdir = tables_dir / table
+                    if not tdir.exists(): code = 404; raise FileNotFoundError(f"Table '{table}' does not exist.")
+                    shutil.rmtree(tdir); out["message"] = f"Table '{table}' dropped successfully."
+                elif path.startswith("/delete_from/"):
+                    if not self.permission("delete_from"): raise PermissionError("Permission denied for 'delete_from'.")
+                    table = valid_name(path.rstrip("/").split("/")[-1], "table name")
+                    tdir = tables_dir / table
+                    if not tdir.exists(): code = 404; raise FileNotFoundError(f"Table '{table}' does not exist.")
+                    (tdir / "tables").write_text(""); out["message"] = f"All records deleted from table '{table}'."
+                elif path.startswith("/delete_record/"):
+                    if not self.permission("delete_record"): raise PermissionError("Permission denied for 'delete_record'.")
+                    bits = path.strip("/").split("/")
+                    if len(bits) < 3: code = 400; raise ValueError("Use /delete_record/<table>/<record>")
+                    table = valid_name(bits[1], "table name")
+                    target = urllib.parse.unquote("/".join(bits[2:]))
+                    tdir = tables_dir / table
+                    if not tdir.exists(): code = 404; raise FileNotFoundError(f"Table '{table}' does not exist.")
+                    f = tdir / "tables"; old = f.read_text(encoding="utf-8").splitlines()
+                    new = [x for x in old if x.strip() != target]
+                    if len(new) == len(old): code = 404; raise FileNotFoundError("Record not found.")
+                    f.write_text("".join(x + "\n" for x in new)); out["message"] = "Record deleted successfully."
+                else:
+                    out["message"] = f"Endpoint '{path}' reached and executed successfully."
+            except PermissionError as exc:
+                code = 403; out = {"status": "error", "database": db, "endpoint": path, "error": str(exc)}
+            except FileNotFoundError as exc:
+                code = code if code != 200 else 404; out = {"status": "error", "database": db, "endpoint": path, "error": str(exc)}
+            except FileExistsError as exc:
+                code = 409; out = {"status": "error", "database": db, "endpoint": path, "error": str(exc)}
+            except Exception as exc:
+                code = code if code != 200 else 400; out = {"status": "error", "database": db, "endpoint": path, "error": str(exc)}
+            self.send_json(code, out)
+
+    class ThreadedHTTPServer(http.server.ThreadingHTTPServer):
+        daemon_threads = True
+        allow_reuse_address = True
+
+    server = ThreadedHTTPServer((address, port), Handler)
+    if proto == "https":
+        api_dir = cfg_file.parent
+        cert = api_dir / "server.crt"
+        key = api_dir / "server.key"
+        pem = api_dir / "server.pem"
+        if not cert.exists() or not key.exists():
+            subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-keyout", str(key),
+                            "-out", str(cert), "-days", "365", "-nodes", "-subj", "/CN=localhost"],
+                           check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            pem.write_bytes(cert.read_bytes() + key.read_bytes())
+            os.chmod(key, 0o600); os.chmod(pem, 0o600)
+        import ssl
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(str(cert), str(key))
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+    print(f"[API] {db}/{api_type} listening at {proto}://{address}:{port}{base_path}/", flush=True)
+    server.serve_forever()
+
+
+def process_meta_path(pid_file: pathlib.Path) -> pathlib.Path:
+    return pid_file.with_name(pid_file.name + ".meta.json")
+
+
+def read_proc_stat(pid: int) -> dict[str, int] | None:
+    try:
+        raw = pathlib.Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        close = raw.rfind(")")
+        fields = raw[close + 2:].split()
+        return {"ppid": int(fields[1]), "pgid": int(fields[2]), "start_ticks": int(fields[19])}
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def proc_cmdline(pid: int) -> list[str]:
+    try:
+        raw = pathlib.Path(f"/proc/{pid}/cmdline").read_bytes()
+        return [x.decode("utf-8", errors="replace") for x in raw.split(b"\0") if x]
+    except OSError:
+        return []
+
+
+def process_token_pids(token: str) -> list[int]:
+    """Find every live process carrying this service's unique token.
+
+    Unlike killing only the Bash PID, this also finds the embedded Python
+    interpreter and terminal shells even when a desktop terminal reparents
+    them into a different process group.
+    """
+    if not token:
+        return []
+    expected = f"DBM_PROCESS_TOKEN={token}".encode()
+    found: list[int] = []
+    try:
+        entries = list(pathlib.Path("/proc").iterdir())
+    except OSError:
+        return found
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            env = (entry / "environ").read_bytes().split(b"\0")
+            if expected in env:
+                found.append(int(entry.name))
+        except (OSError, ValueError):
+            continue
+    return found
+
+
+def process_group_has_token(pgid: int, token: str) -> bool:
+    return any((info := read_proc_stat(pid)) and info["pgid"] == pgid
+               for pid in process_token_pids(token))
+
+
+def pid_value(pid_file: pathlib.Path) -> int | None:
+    try:
+        raw = pid_file.read_text(encoding="utf-8").strip()
+        if raw.startswith("{"):
+            raw = str(json.loads(raw).get("pid", ""))
+        return int(raw)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def write_managed_pid(pid_file: pathlib.Path, proc: subprocess.Popen, token: str, role: str) -> None:
+    info = read_proc_stat(proc.pid)
+    if not info:
+        raise RuntimeError(f"Could not read process identity for PID {proc.pid}.")
+    pid_file.parent.mkdir(parents=True, exist_ok=True)
+    pid_file.write_text(f"{proc.pid}\n", encoding="utf-8")
+    meta = {
+        "pid": proc.pid,
+        "pgid": info["pgid"],
+        "start_ticks": info["start_ticks"],
+        "token": token,
+        "role": role,
+        "script": str(SHELL_SCRIPT),
+    }
+    meta_path = process_meta_path(pid_file)
+    meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    os.chmod(pid_file, 0o600)
+    os.chmod(meta_path, 0o600)
+
+
+def remove_managed_pid(pid_file: pathlib.Path, token: str | None = None) -> None:
+    meta_path = process_meta_path(pid_file)
+    if token and meta_path.exists():
+        try:
+            if json.loads(meta_path.read_text(encoding="utf-8")).get("token") != token:
+                return
+        except Exception:
+            return
+    with contextlib.suppress(FileNotFoundError): pid_file.unlink()
+    with contextlib.suppress(FileNotFoundError): meta_path.unlink()
+
+
+def _is_embedded_manager_script(candidate: str) -> bool:
+    try:
+        path = pathlib.Path(candidate)
+        if not path.is_file() or path.suffix.lower() != ".sh":
+            return False
+        content = path.read_text(encoding="utf-8", errors="ignore")
+        return "#__DBM_PYTHON_BEGIN__" in content and "--db-manager-internal" in content
+    except OSError:
+        return False
+
+
+def legacy_managed_command(pid: int, pid_file: pathlib.Path) -> bool:
+    """Identify this application's older PID-file formats without trusting PID alone."""
+    cmd = proc_cmdline(pid)
+    if not cmd:
+        return False
+    if pid_file.name == "api.pid":
+        api_type = pid_file.parent.name
+        db = pid_file.parents[2].name
+        # Previous unified editions ran `bash <manager.sh> --db-manager-internal --serve ...`.
+        embedded = any(_is_embedded_manager_script(item) for item in cmd)
+        if embedded and "--db-manager-internal" in cmd and "--serve" in cmd:
+            return db in cmd and api_type in cmd
+        # Earlier editions ran Python directly from the database's server.py.
+        legacy_server = str(pid_file.parent / "server.py")
+        return legacy_server in cmd and "server.py" in " ".join(cmd)
+    if pid_file.name.startswith("backup_") and pid_file.name.endswith(".pid"):
+        func = pid_file.name[len("backup_"):-len(".pid")]
+        embedded = any(_is_embedded_manager_script(item) for item in cmd)
+        if embedded and "--db-manager-internal" in cmd and "--worker" in cmd:
+            # Database-scoped worker PID files carry the database in their path.
+            if pid_file.parent.parent.name == "secrets" and pid_file.parent.parent.parent.name == "database":
+                db = pid_file.parent.parent.parent.name
+                return db in cmd and func in cmd
+            # Old global workers had no database-scoped folder; match function and script.
+            return func in cmd
+        # The initial manager launched the generated backup_server.py directly.
+        legacy_worker = str(pid_file.parent / "backup_server.py")
+        return legacy_worker in cmd and func in cmd
+    return False
+
+
+def process_alive(pid_file: pathlib.Path) -> bool:
+    if not pid_file.exists():
+        return False
+    pid = pid_value(pid_file)
+    if pid is None:
+        remove_managed_pid(pid_file)
+        return False
+    meta_path = process_meta_path(pid_file)
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            pgid = int(meta.get("pgid", pid))
+            token = str(meta.get("token", ""))
+            if token and process_token_pids(token):
+                return True
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+        remove_managed_pid(pid_file)
+        return False
+    # Compatibility for PIDs created by previous versions: only treat a PID
+    # as ours when its command line identifies this exact embedded service.
+    return bool(read_proc_stat(pid) and legacy_managed_command(pid, pid_file))
+
+
+def process_tree(root_pid: int) -> list[int]:
+    """Return descendants of root_pid (children first) using /proc PPID data."""
+    ppid_map: dict[int, list[int]] = {}
+    try:
+        entries = pathlib.Path("/proc").iterdir()
+        for entry in entries:
+            if entry.name.isdigit():
+                info = read_proc_stat(int(entry.name))
+                if info:
+                    ppid_map.setdefault(info["ppid"], []).append(int(entry.name))
+    except OSError:
+        return [root_pid]
+    ordered: list[int] = []
+    stack = [(root_pid, False)]
+    seen: set[int] = set()
+    while stack:
+        pid, visited = stack.pop()
+        if visited:
+            ordered.append(pid)
+            continue
+        if pid in seen:
+            continue
+        seen.add(pid)
+        stack.append((pid, True))
+        for child in ppid_map.get(pid, []):
+            stack.append((child, False))
+    return ordered
+
+
+def stop_pid_file(pid_file: pathlib.Path) -> bool:
+    if not pid_file.exists() and not process_meta_path(pid_file).exists():
+        return False
+    pid = pid_value(pid_file)
+    meta_path = process_meta_path(pid_file)
+    stopped = False
+    meta = {}
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            meta = {}
+    token = str(meta.get("token", ""))
+    pgid = int(meta.get("pgid", pid or -1)) if str(meta.get("pgid", pid or -1)).lstrip("-").isdigit() else -1
+
+    # Current managed daemons get a unique environment token and a dedicated
+    # process group. Killing the group always terminates the Bash wrapper, the
+    # embedded Python interpreter and any subprocesses it spawned.
+    managed_pids = process_token_pids(token) if token else []
+    if token and managed_pids:
+        # Signal each token-owned process, not merely the recorded Bash PID or
+        # its process group. This also handles GUI terminal clients that reparent
+        # their visible shell into another session/process group.
+        for managed_pid in managed_pids:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(managed_pid, signal.SIGTERM)
+        deadline = time.monotonic() + 2.5
+        while time.monotonic() < deadline and process_token_pids(token):
+            time.sleep(0.1)
+        for managed_pid in process_token_pids(token):
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(managed_pid, signal.SIGKILL)
+        stopped = True
+    elif pid and read_proc_stat(pid) and legacy_managed_command(pid, pid_file):
+        info = read_proc_stat(pid) or {}
+        group = info.get("pgid", -1)
+        if group == pid:
+            with contextlib.suppress(ProcessLookupError, PermissionError): os.killpg(group, signal.SIGTERM)
+            time.sleep(0.25)
+            with contextlib.suppress(ProcessLookupError, PermissionError): os.killpg(group, signal.SIGKILL)
+        else:
+            # Old workers could share the terminal's process group. Never kill
+            # that group; terminate only the identified service's process tree.
+            tree = process_tree(pid)
+            for child in tree:
+                with contextlib.suppress(ProcessLookupError, PermissionError): os.kill(child, signal.SIGTERM)
+            time.sleep(0.25)
+            for child in tree:
+                with contextlib.suppress(ProcessLookupError, PermissionError): os.kill(child, signal.SIGKILL)
+        stopped = True
+    else:
+        # Handle the narrow upgrade case where the old Bash parent died but its
+        # child Python server remains in the old dedicated process group.
+        remaining = process_token_pids(token) if token else []
+        if remaining:
+            for managed_pid in remaining:
+                with contextlib.suppress(ProcessLookupError, PermissionError): os.kill(managed_pid, signal.SIGTERM)
+            time.sleep(0.25)
+            for managed_pid in process_token_pids(token):
+                with contextlib.suppress(ProcessLookupError, PermissionError): os.kill(managed_pid, signal.SIGKILL)
+            stopped = True
+
+    remove_managed_pid(pid_file)
+    return stopped or pid is not None
+
+
+def process_env(token: str) -> dict[str, str]:
+    env = os.environ.copy()
+    env["DB_MANAGER_SCRIPT"] = str(SHELL_SCRIPT)
+    env["DBM_PROCESS_TOKEN"] = token
+    return env
+
+
+def stop_backup_worker(db: str, func: str) -> bool:
+    d = dirs(db)
+    worker_stopped = stop_pid_file(d["secrets"] / f"backup_{func}.pid")
+    viewer_stopped = stop_pid_file(d["secrets"] / f"backup_{func}_viewer.pid")
+    return worker_stopped or viewer_stopped
+
+
+def parse_args(raw: str) -> list[str]:
+    # '&' is retained as a legacy separator; normal whitespace is also accepted.
+    raw = raw.replace("&", " ")
+    try: return shlex.split(raw)
+    except ValueError: return raw.split()
+
+
+def check_api_port_available(db: str, api_type: str, address: str, port: int) -> None:
+    if DB_ROOT.exists():
+        for base in DB_ROOT.iterdir():
+            if not base.is_dir(): continue
+            for kind in ("public", "secret"):
+                if base.name == db and kind == api_type: continue
+                cfg_path = base / "api" / kind / "api.cfg"
+                cfg = read_kv(cfg_path)
+                if cfg and cfg.get("Port", "8080") == str(port) and cfg.get("Address", "localhost") == address:
+                    raise ValueError(f"Address '{address}' and port {port} are already configured for database '{base.name}' API '{kind}'.")
+
+
+def prompt_value(label: str, default: str = "") -> str:
+    suffix = f" [{default}]" if default else ""
+    value = input(f"{label}{suffix}: ").strip()
+    return value or default
+
+
+def api_setup(db: str, api_type: str) -> None:
+    ensure_db_layout(db)
+    show_cli_banner()
+    print(f"{CYAN}{BOLD}      API SETUP ({api_type.upper()}) FOR: {db}      {RESET}\n")
+    name = prompt_value("Enter API Name", "api")
+    if not name.strip(): raise ValueError("API name is required.")
+    protocol = prompt_value("Enter Protocol (http or https)", "http").lower()
+    if protocol not in ("http", "https"): raise ValueError("Protocol must be http or https.")
+    address = prompt_value("Enter API Address", "localhost")
+    port_text = prompt_value("Enter API Port", "8080")
+    if not port_text.isdigit() or not (1 <= int(port_text) <= 65535): raise ValueError("Port must be between 1 and 65535.")
+    port = int(port_text)
+    check_api_port_available(db, api_type, address, port)
+    debug = prompt_value("Enter API Debug (true or false)", "true").lower()
+    if debug not in ("true", "false"): raise ValueError("API Debug must be true or false.")
+    show_keys(db)
+    key1 = resolve_key(db, getpass.getpass("Enter FIRST API Secret Key: ").strip())
+    key2 = resolve_key(db, getpass.getpass("Enter SECOND API Secret Key: ").strip())
+    if not key1 or not key2: raise ValueError("Both secret keys are required.")
+    if any(ch in key1 + key2 for ch in "\n=/\r"): raise ValueError("API keys cannot contain '/', '=' or line breaks.")
+    if hmac.compare_digest(key1, key2): raise ValueError("The two API keys must be different.")
+    register_key(db, key1); register_key(db, key2)
+    cfg_path = api_cfg_path(db, api_type)
+    was_running = process_alive(cfg_path.parent / "api.pid")
+    if was_running: stop_pid_file(cfg_path.parent / "api.pid")
+    cfg = {"Name": name, "Protocol": protocol, "Address": address, "Port": str(port),
+           "ApiDebug": debug, "SecretKey1": key1, "SecretKey2": key2}
+    write_kv(cfg_path, cfg, 0o600)
+    if was_running: api_start(db, api_type)
+    cprint(f"API ({api_type}) setup completed successfully with two secret keys.")
+    cprint(f"Base path: {protocol}://{address}:{port}{api_prefix(cfg)}/", CYAN)
+
+
+def api_edit(db: str, api_type: str) -> None:
+    show_cli_banner()
+    path = api_cfg_path(db, api_type)
+    cfg = read_kv(path)
+    if not cfg: raise ValueError(f"API ({api_type}) is not configured.")
+    cfg["Name"] = prompt_value("Enter new Name", cfg.get("Name", "api"))
+    cfg["Protocol"] = prompt_value("Enter new Protocol", cfg.get("Protocol", "http")).lower()
+    if cfg["Protocol"] not in ("http", "https"): raise ValueError("Protocol must be http or https.")
+    cfg["Address"] = prompt_value("Enter new Address", cfg.get("Address", "localhost"))
+    port = prompt_value("Enter new Port", cfg.get("Port", "8080"))
+    if not port.isdigit() or not (1 <= int(port) <= 65535): raise ValueError("Invalid port.")
+    check_api_port_available(db, api_type, cfg["Address"], int(port))
+    cfg["Port"] = port
+    cfg["ApiDebug"] = prompt_value("Enter new API Debug", cfg.get("ApiDebug", "true")).lower()
+    if cfg["ApiDebug"] not in ("true", "false"): raise ValueError("API Debug must be true or false.")
+    show_keys(db)
+    cfg["SecretKey1"] = resolve_key(db, getpass.getpass("Enter FIRST API Secret Key: ").strip())
+    cfg["SecretKey2"] = resolve_key(db, getpass.getpass("Enter SECOND API Secret Key: ").strip())
+    if not cfg["SecretKey1"] or not cfg["SecretKey2"] or hmac.compare_digest(cfg["SecretKey1"], cfg["SecretKey2"]):
+        raise ValueError("Two different, non-empty secret keys are required.")
+    if any(ch in cfg["SecretKey1"] + cfg["SecretKey2"] for ch in "\n=/\r"):
+        raise ValueError("API keys cannot contain '/', '=' or line breaks.")
+    register_key(db, cfg["SecretKey1"]); register_key(db, cfg["SecretKey2"])
+    was_running = process_alive(path.parent / "api.pid")
+    if was_running: stop_pid_file(path.parent / "api.pid")
+    write_kv(path, cfg, 0o600)
+    if was_running: api_start(db, api_type)
+    cprint("API configuration updated successfully.")
+
+
+def api_start(db: str, api_type: str) -> None:
+    d = ensure_db_layout(db)
+    cfg_path = api_cfg_path(db, api_type)
+    cfg = read_kv(cfg_path)
+    if not cfg: raise ValueError(f"API ({api_type}) is not configured. Run api_setup {api_type} first.")
+    api_pair(db, api_type)
+    api_dir = cfg_path.parent
+    pid_file = api_dir / "api.pid"
+    if process_alive(pid_file): raise ValueError(f"API ({api_type}) is already running (PID {pid_value(pid_file)}).")
+    address = cfg.get("Address", "localhost")
+    port = int(cfg.get("Port", "8080"))
+    with socket.socket() as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try: s.bind((address, port))
+        except OSError as exc: raise ValueError(f"Address '{address}' and port {port} are unavailable: {exc}")
+    log = (api_dir / "server.log").open("ab")
+    token = uuid.uuid4().hex
+    proc = subprocess.Popen(["bash", str(SHELL_SCRIPT), "--db-manager-internal", "--serve", db, api_type],
+                            stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                            start_new_session=True, cwd=pathlib.Path.cwd(), env=process_env(token), close_fds=True)
+    time.sleep(0.35)
+    if proc.poll() is not None:
+        log.close()
+        raise RuntimeError(f"API failed to start. Check {api_dir / 'server.log'}.")
+    write_managed_pid(pid_file, proc, token, f"api:{db}:{api_type}")
+    log.close()
+    cprint(f"API ({api_type}) server started successfully on port {port} (PID: {proc.pid})!")
+    cprint(f"URL: {cfg.get('Protocol', 'http')}://{address}:{port}{api_prefix(cfg)}/?key=<key1>/<key2>", CYAN)
+
+
+def api_status(db: str, api_type: str) -> None:
+    path = api_cfg_path(db, api_type)
+    cfg = read_kv(path)
+    pid = path.parent / "api.pid"
+    if not cfg: raise ValueError(f"API ({api_type}) is not configured.")
+    running = process_alive(pid)
+    print(f"{CYAN}{BOLD}=================================================={RESET}")
+    print(f"{CYAN}{BOLD}       API SERVER STATUS ({api_type.upper()})       {RESET}")
+    print(f"{CYAN}{BOLD}=================================================={RESET}")
+    for label, value in (("Name", cfg.get("Name", "")), ("Type", api_type.upper()),
+                         ("Status", "Running" if running else "Stopped"),
+                         ("PID", str(pid_value(pid)) if running else "-"),
+                         ("Protocol", cfg.get("Protocol", "http")), ("Address", cfg.get("Address", "localhost")),
+                         ("Port", cfg.get("Port", "8080")), ("Base Path", api_prefix(cfg)),
+                         ("Debug", cfg.get("ApiDebug", "true"))):
+        print(f"  {BOLD}{label + ':':<15}{RESET} {GREEN if label == 'Status' and running else YELLOW}{value}{RESET}")
+    print(f"{CYAN}=================================================={RESET}")
+
+
+def api_request(db: str, args: list[str]) -> None:
+    if len(args) < 2: raise ValueError("Usage: api_request <public|secret> <endpoint>")
+    api_type = args[0]
+    cfg = read_kv(api_cfg_path(db, api_type))
+    if not cfg: raise ValueError(f"API ({api_type}) is not configured.")
+    pid_file = api_cfg_path(db, api_type).parent / "api.pid"
+    if not process_alive(pid_file): raise ValueError(f"API ({api_type}) is not running.")
+    key1, key2 = api_pair(db, api_type)
+    endpoint = " ".join(args[1:]).strip().lstrip("/")
+    endpoint = endpoint.replace(" ", "/")
+    base = f"{cfg.get('Protocol', 'http')}://{cfg.get('Address', 'localhost')}:{cfg.get('Port', '8080')}{api_prefix(cfg)}"
+    key_value = urllib.parse.quote(key1, safe="") + "/" + urllib.parse.quote(key2, safe="")
+    url = f"{base}/{endpoint}/?key={key_value}" if endpoint else f"{base}/?key={key_value}"
+    result = subprocess.run(["curl", "-sS", "-k", "--max-time", "10", url], text=True, capture_output=True)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "API request failed.")
+    print(result.stdout)
+
+
+def api_key_command(db: str, args: list[str]) -> None:
+    if not args or args[0] == "list":
+        show_keys(db); return
+    action = args[0].lower()
+    if action == "add":
+        if len(args) != 2: raise ValueError("Usage: api_key add <key>")
+        value = args[1]
+        if not value or any(ch in value for ch in "\n=/") or "\r" in value: raise ValueError("Invalid key value. Keys cannot contain '/', '=' or line breaks.")
+        records = key_records(db)
+        if any(value == v for _, v in records): raise ValueError("This secret key already exists.")
+        idx = 1
+        names = {k for k, _ in records}
+        while f"secret_key_{idx}" in names: idx += 1
+        records.append((f"secret_key_{idx}", value)); write_key_records(db, records)
+        cprint(f"Secret key added successfully as secret_key_{idx}.")
+    elif action == "remove":
+        if len(args) != 2: raise ValueError("Usage: api_key remove <key|secret_key_N>")
+        target = args[1]
+        records = key_records(db)
+        match = next(((k, v) for k, v in records if k == target or v == target), None)
+        if match:
+            for api_type in ("public", "secret"):
+                api_cfg = read_kv(api_cfg_path(db, api_type))
+                if match[1] in (api_cfg.get("SecretKey1"), api_cfg.get("SecretKey2")):
+                    raise ValueError(f"Key '{target}' is currently used by API '{api_type}'. Edit/delete that API configuration first.")
+        new = [(k, v) for k, v in records if k != target and v != target]
+        if len(new) == len(records): raise ValueError(f"Secret key '{target}' was not found.")
+        write_key_records(db, new); cprint(f"Secret key '{target}' removed successfully.")
+    else:
+        raise ValueError("Usage: api_key <add|remove|list> <key>")
+
+
+def backup_candidates(db: str) -> list[pathlib.Path]:
+    bdir = backup_directory(db, read_backup_config(db))
+    files = [p for p in bdir.iterdir() if p.is_file() and p.suffix in (".tar", ".gz", ".enc") and not p.name.endswith((".sha256", ".sig"))]
+    # .tar.gz has suffix .gz; .enc is encrypted.
+    return sorted(files, key=lambda p: p.stat().st_mtime)
+
+
+def archive_base(path: pathlib.Path) -> str:
+    n = path.name
+    for suffix in (".tar.gz.enc", ".tar.enc", ".tar.gz", ".tar"):
+        if n.endswith(suffix): return n[:-len(suffix)]
+    return path.stem
+
+
+def key_file(db: str, name: str) -> pathlib.Path:
+    return ensure_db_layout(db)["secrets"] / name
+
+
+def ensure_secret_file(path: pathlib.Path) -> bytes:
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(os.urandom(32)); os.chmod(path, 0o600)
+    return path.read_bytes()
+
+
+def apply_storage_permissions(db: str, cfg: dict[str, dict[str, str]]) -> None:
+    raw = cfg_value(cfg, "storage_permissions", "700")
+    if not re.fullmatch(r"0?[0-7]{3}", raw): raise ValueError("storage_permissions must be an octal mode such as 700 or 600.")
+    mode = int(raw, 8)
+    bdir = backup_directory(db, cfg)
+    # The directory must retain owner write/execute rights so the manager can
+    # create, enumerate and remove archives even when a restrictive file mode is chosen.
+    directory_mode = mode | 0o300
+    with contextlib.suppress(OSError): os.chmod(bdir, directory_mode)
+    for f in bdir.iterdir():
+        if f.is_file():
+            with contextlib.suppress(OSError): os.chmod(f, mode & 0o666)
+
+
+def run_cleanup(db: str, cfg: dict[str, dict[str, str]], write_log=None) -> int:
+    files = backup_candidates(db)
+    max_backups = int(cfg_value(cfg, "max_backups", "10"))
+    if max_backups < 1: max_backups = 1
+    keep_daily = cfg_value(cfg, "keep_daily", "false").lower() == "true"
+    keep_weekly = cfg_value(cfg, "keep_weekly", "false").lower() == "true"
+    protected: set[pathlib.Path] = set()
+    if keep_daily:
+        by_day: dict[str, pathlib.Path] = {}
+        for p in files:
+            day = dt.datetime.fromtimestamp(p.stat().st_mtime).date().isoformat()
+            if day not in by_day or p.stat().st_mtime > by_day[day].stat().st_mtime: by_day[day] = p
+        protected.update(by_day.values())
+    if keep_weekly:
+        by_week: dict[tuple[int, int], pathlib.Path] = {}
+        for p in files:
+            iso = dt.datetime.fromtimestamp(p.stat().st_mtime).isocalendar()
+            key = (iso.year, iso.week)
+            if key not in by_week or p.stat().st_mtime > by_week[key].stat().st_mtime: by_week[key] = p
+        protected.update(by_week.values())
+    keep = set(protected)
+    for p in reversed(files):
+        if len(keep) >= max(max_backups, len(protected)): break
+        keep.add(p)
+    removed = 0
+    for p in files:
+        if p not in keep:
+            for side in (p.with_name(p.name + ".sha256"), p.with_name(p.name + ".sig")):
+                with contextlib.suppress(FileNotFoundError): side.unlink()
+            with contextlib.suppress(OSError): p.unlink(); removed += 1
+    if write_log: write_log(f"[BCKUP_DEL] Retention cleanup completed; removed {removed} backup(s).")
+    return removed
+
+
+def create_backup(db: str, name: str | None = None, force: bool = False, automated: bool = False,
+                  logger=None) -> pathlib.Path:
+    d = ensure_db_layout(db)
+    cfg = read_backup_config(db)
+    prefix = cfg_value(cfg, "default_backup_name", "auto") or "auto"
+    if not name:
+        name = f"{prefix}-{dt.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+    valid_backup_name(name)
+    compressed = cfg_value(cfg, "auto_compression", "true").lower() == "true"
+    encrypt = cfg_value(cfg, "encrypt_backups", "false").lower() == "true"
+    verify = cfg_value(cfg, "verify_integrity", "false").lower() == "true"
+    sign = cfg_value(cfg, "sign_manifest", "false").lower() == "true"
+    suffix = ".tar.gz" if compressed else ".tar"
+    if encrypt: suffix += ".enc"
+    backup_dir = backup_directory(db, cfg)
+    target = backup_dir / (name + suffix)
+    if target.exists() and not force: raise FileExistsError(f"Backup '{name}' already exists. Use --force to overwrite it.")
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    tmp_tar = None
+    try:
+        fd, tmp_name = tempfile.mkstemp(prefix=".backup-", suffix=".tar.gz" if compressed else ".tar", dir=backup_dir)
+        os.close(fd); tmp_tar = pathlib.Path(tmp_name)
+        mode = "w:gz" if compressed else "w"
+        with tarfile.open(tmp_tar, mode) as tar:
+            def archive_filter(info):
+                rel = info.name
+                if rel == f"{db}/backups" or rel.startswith(f"{db}/backups/"):
+                    return None
+                if rel.endswith("/secrets/backup_encryption.key") or rel.endswith("/secrets/backup_manifest.key"):
+                    return None
+                if rel.endswith(".pid") or rel.endswith(".log"):
+                    return None
+                return info
+            tar.add(d["base"], arcname=db, filter=archive_filter)
+        if encrypt:
+            password_file = key_file(db, "backup_encryption.key")
+            ensure_secret_file(password_file)
+            enc_tmp = tmp_tar.with_suffix(tmp_tar.suffix + ".enc")
+            run = subprocess.run(["openssl", "enc", "-aes-256-cbc", "-salt", "-pbkdf2", "-in", str(tmp_tar),
+                                  "-out", str(enc_tmp), "-pass", f"file:{password_file}"], capture_output=True, text=True)
+            if run.returncode: raise RuntimeError("Backup encryption failed: " + run.stderr.strip())
+            tmp_tar.unlink(); tmp_tar = enc_tmp
+        if target.exists(): target.unlink()
+        tmp_tar.replace(target); tmp_tar = None
+        os.chmod(target, int(cfg_value(cfg, "storage_permissions", "700"), 8))
+        digest = hashlib.sha256(target.read_bytes()).hexdigest()
+        if verify:
+            target.with_name(target.name + ".sha256").write_text(f"{digest}  {target.name}\n", encoding="utf-8")
+        if sign:
+            secret = ensure_secret_file(key_file(db, "backup_manifest.key"))
+            signature = hmac.new(secret, digest.encode(), hashlib.sha256).hexdigest()
+            target.with_name(target.name + ".sig").write_text(signature + "\n", encoding="ascii")
+        if cfg_value(cfg, "auto_cleanup", "false").lower() == "true":
+            run_cleanup(db, cfg, logger)
+        apply_storage_permissions(db, cfg)
+        message = f"[BACKUP] Backup '{name}' created successfully ({target.name})."
+        if logger: logger(message)
+        else: cprint(message)
+        if cfg_value(cfg, "notify_on_completion", "false").lower() == "true":
+            subprocess.run(["notify-send", "Custom DB Manager", f"Backup {name} completed"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return target
+    finally:
+        if tmp_tar:
+            with contextlib.suppress(FileNotFoundError): tmp_tar.unlink()
+
+
+def find_backup(db: str, name: str) -> pathlib.Path:
+    valid_backup_name(name)
+    matches = [p for p in backup_candidates(db) if archive_base(p) == name]
+    if not matches: raise FileNotFoundError(f"Backup '{name}' does not exist in database '{db}'.")
+    return matches[-1]
+
+
+def verify_backup_file(db: str, path: pathlib.Path) -> None:
+    cfg = read_backup_config(db)
+    checksum = path.with_name(path.name + ".sha256")
+    signature = path.with_name(path.name + ".sig")
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if cfg_value(cfg, "verify_integrity", "false").lower() == "true" or checksum.exists():
+        if not checksum.exists(): raise RuntimeError("Integrity verification is enabled, but the SHA-256 manifest is missing.")
+        expected = checksum.read_text(encoding="utf-8").split()[0]
+        if not hmac.compare_digest(digest, expected): raise RuntimeError("Backup integrity check failed (SHA-256 mismatch).")
+    if cfg_value(cfg, "sign_manifest", "false").lower() == "true" or signature.exists():
+        if not signature.exists(): raise RuntimeError("Backup signature is missing.")
+        secret = ensure_secret_file(key_file(db, "backup_manifest.key"))
+        expected_sig = hmac.new(secret, digest.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature.read_text().strip(), expected_sig): raise RuntimeError("Backup signature validation failed.")
+
+
+def decrypt_backup(db: str, path: pathlib.Path, out_path: pathlib.Path) -> pathlib.Path:
+    if not path.name.endswith(".enc"):
+        shutil.copy2(path, out_path); return out_path
+    password_file = key_file(db, "backup_encryption.key")
+    if not password_file.exists(): raise RuntimeError("The database backup encryption key is missing; this archive cannot be decrypted.")
+    result = subprocess.run(["openssl", "enc", "-d", "-aes-256-cbc", "-pbkdf2", "-in", str(path),
+                             "-out", str(out_path), "-pass", f"file:{password_file}"], capture_output=True, text=True)
+    if result.returncode: raise RuntimeError("Backup decryption failed: " + result.stderr.strip())
+    return out_path
+
+
+def safe_extract_db(archive: pathlib.Path, temp_dir: pathlib.Path, db: str) -> pathlib.Path:
+    with tarfile.open(archive, "r:*") as tar:
+        members = tar.getmembers()
+        for m in members:
+            p = pathlib.PurePosixPath(m.name)
+            if p.is_absolute() or ".." in p.parts or not p.parts or p.parts[0] != db:
+                raise RuntimeError("Backup archive contains an unsafe or unexpected path.")
+        tar.extractall(temp_dir, members=members, filter="data")
+    restored = temp_dir / db
+    if not restored.is_dir() or not (restored / f"{db}.db").exists():
+        raise RuntimeError("Backup archive does not contain a valid database structure.")
+    return restored
+
+
+def running_api_types(db: str) -> list[str]:
+    result = []
+    for kind in ("public", "secret"):
+        if process_alive(db_dir(db) / "api" / kind / "api.pid"): result.append(kind)
+    return result
+
+
+def restore_backup(db: str, name: str, force: bool = False) -> None:
+    d = ensure_db_layout(db)
+    active_backup_cfg = read_backup_config(db)
+    active_backup_store = backup_directory(db, active_backup_cfg)
+    active_storage_path = cfg_value(active_backup_cfg, "backup_storage_path", "")
+    archive = find_backup(db, name)
+    if not force:
+        answer = input(f"Warning: Restore backup '{name}' and replace current database '{db}'? (yes/no): ").strip().lower()
+        if answer != "yes":
+            cprint("Action cancelled.", YELLOW); return
+    verify_backup_file(db, archive)
+    active_apis = running_api_types(db)
+    schedule_was_active = {}
+    schedule_values = {}
+    for line in d["schedule_cfg"].read_text(encoding="utf-8", errors="replace").splitlines():
+        if "=" in line:
+            fn, val = line.split("=", 1)
+            status, _, interval = val.partition(":")
+            schedule_values[fn.strip()] = (status.strip(), interval.strip())
+            schedule_was_active[fn.strip()] = process_alive(d["secrets"] / f"backup_{fn.strip()}.pid")
+    persistent_keys = {}
+    for secret_name in ("backup_encryption.key", "backup_manifest.key"):
+        secret_path = d["secrets"] / secret_name
+        if secret_path.exists(): persistent_keys[secret_name] = secret_path.read_bytes()
+    for kind in ("public", "secret"):
+        stop_pid_file(d["api"] / kind / "api.pid")
+    for kind in ("backup", "backup_delete"):
+        stop_backup_worker(db, kind)
+    preserve_local_backups = active_backup_store.resolve() == d["backups"].resolve()
+    with tempfile.TemporaryDirectory(prefix="customdb-restore-") as td:
+        temp = pathlib.Path(td)
+        decoded = temp / "restore.tar"
+        decrypt_backup(db, archive, decoded)
+        unpack = temp / "unpack"; unpack.mkdir()
+        restored = safe_extract_db(decoded, unpack, db)
+        preserved_backups = temp / "backups-preserved"
+        if preserve_local_backups and d["backups"].exists():
+            shutil.move(str(d["backups"]), str(preserved_backups))
+        old = temp / "previous-database"
+        if d["base"].exists(): shutil.move(str(d["base"]), str(old))
+        try:
+            shutil.move(str(restored), str(d["base"]))
+            if preserved_backups.exists(): shutil.move(str(preserved_backups), str(d["backups"]))
+            ensure_db_layout(db)
+            # Keep the currently selected secondary-disk destination across restore.
+            restored_cfg = read_backup_config(db)
+            for section_values in restored_cfg.values():
+                if "backup_storage_path" in section_values:
+                    section_values["backup_storage_path"] = active_storage_path
+            if not any("backup_storage_path" in values for values in restored_cfg.values()):
+                restored_cfg.setdefault("General", {})["backup_storage_path"] = active_storage_path
+            write_backup_config(d["backup_cfg"], restored_cfg)
+            for secret_name, secret_data in persistent_keys.items():
+                secret_path = d["secrets"] / secret_name
+                secret_path.write_bytes(secret_data); os.chmod(secret_path, 0o600)
+        except Exception:
+            with contextlib.suppress(Exception):
+                if d["base"].exists(): shutil.rmtree(d["base"])
+                if old.exists(): shutil.move(str(old), str(d["base"]))
+                if preserved_backups.exists(): shutil.move(str(preserved_backups), str(d["backups"]))
+            raise
+    for kind in active_apis:
+        try: api_start(db, kind)
+        except Exception as exc: cprint(f"Warning: API ({kind}) was not restarted: {exc}", YELLOW)
+    restored_schedule = {}
+    for line in d["schedule_cfg"].read_text(encoding="utf-8", errors="replace").splitlines():
+        if "=" in line:
+            fn, val = line.split("=", 1); status, _, interval = val.partition(":")
+            restored_schedule[fn.strip()] = (status.strip(), interval.strip())
+    for func, was_active in schedule_was_active.items():
+        status, interval = restored_schedule.get(func, ("false", ""))
+        if was_active and status == "true" and interval:
+            with contextlib.suppress(Exception): start_worker(db, func, interval)
+    # Match the CLI's internal clear behavior: redraw its startup banner instead
+    # of invoking the operating-system clear utility and leaving a blank screen.
+    show_cli_banner()
+    cprint(f"All active API processes were stopped, database files were replaced, and backup '{name}' was restored successfully.")
+
+
+def delete_backup(db: str, name: str) -> None:
+    path = find_backup(db, name)
+    path.unlink()
+    for suffix in (".sha256", ".sig"):
+        with contextlib.suppress(FileNotFoundError): path.with_name(path.name + suffix).unlink()
+    cprint(f"Backup '{name}' deleted successfully.")
+
+
+def show_backups(db: str) -> None:
+    files = backup_candidates(db)
+    print(f"{CYAN}{BOLD}Available Backups for '{db}':{RESET}")
+    if not files:
+        print("  (No backups found)"); return
+    headers = ("BACKUP NAME", "SIZE", "DATE")
+    rows = []
+    for p in files:
+        size = p.stat().st_size
+        human = f"{size / (1024*1024):.2f} MB" if size >= 1024*1024 else f"{size / 1024:.1f} KB"
+        stamp = dt.datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+        rows.append((archive_base(p), human, stamp))
+    widths = [max(len(headers[i]), *(len(r[i]) for r in rows)) for i in range(3)]
+    print("┌" + "┬".join("─" * (w + 2) for w in widths) + "┐")
+    print("│ " + " │ ".join(f"{headers[i]:<{widths[i]}}" for i in range(3)) + " │")
+    print("├" + "┼".join("─" * (w + 2) for w in widths) + "┤")
+    for row in rows:
+        print("│ " + " │ ".join(f"{row[i]:<{widths[i]}}" for i in range(3)) + " │")
+    print("└" + "┴".join("─" * (w + 2) for w in widths) + "┘")
+
+
+def backup_configs(db: str, args: list[str]) -> None:
+    d = ensure_db_layout(db)
+    cfg = read_backup_config(db)
+    if not args:
+        print(f"{CYAN}{BOLD}Categorized Backup System Configurations ({db}):{RESET}")
+        for section, values in cfg.items():
+            print(f"\n  {YELLOW}[{section}]{RESET}")
+            for k, v in values.items(): print(f"    - {CYAN}{k}{RESET}: {GREEN}{v}{RESET}")
+        print("\nUse: backup_configs <key> [value]")
+        return
+    known_keys = {k for group in cfg.values() for k in group}
+    if len(args) == 1:
+        if args[0] not in known_keys: raise ValueError(f"Backup configuration key '{args[0]}' does not exist.")
+        cprint(f"{args[0]}={cfg_value(cfg, args[0])}", CYAN)
+        if args[0] == "backup_storage_path":
+            cprint("An empty value uses db_manage/database/<database>/backups; an external path stores files in <path>/<database>.", YELLOW)
+        return
+    if len(args) != 2: raise ValueError("Usage: backup_configs <cfg> [val]")
+    key, value = args
+    known = {k for group in cfg.values() for k in group}
+    if key not in known: raise ValueError(f"Backup configuration key '{key}' does not exist.")
+    old_backup_dir = None
+    if key == "backup_storage_path":
+        try:
+            old_backup_dir = backup_directory(db, cfg)
+        except Exception:
+            old_backup_dir = None
+        value = validate_backup_storage_path(value)
+    boolean_keys = {"auto_compression", "verify_integrity", "auto_cleanup", "keep_daily", "keep_weekly",
+                    "background_daemon", "notify_on_completion", "encrypt_backups", "sign_manifest"}
+    if key in boolean_keys: value = parse_bool(value)
+    elif key == "max_backups":
+        if not value.isdigit() or int(value) < 1: raise ValueError("max_backups must be an integer >= 1.")
+    elif key == "default_backup_name": valid_backup_name(value)
+    elif key == "default_interval": parse_interval(value)
+    elif key == "storage_permissions":
+        if not re.fullmatch(r"0?[0-7]{3}", value): raise ValueError("storage_permissions must be an octal mode such as 700 or 600.")
+    for group in cfg.values():
+        if key in group: group[key] = value
+    new_backup_dir = backup_directory(db, cfg)
+    moved_count = 0
+    if key == "backup_storage_path" and old_backup_dir is not None:
+        moved_count = migrate_backup_files(old_backup_dir, new_backup_dir)
+    write_backup_config(d["backup_cfg"], cfg)
+    apply_storage_permissions(db, cfg)
+    cprint(f"Backup configuration '{key}' updated successfully to '{value}'.")
+    if key == "backup_storage_path":
+        cprint(f"Backup destination: {new_backup_dir}", CYAN)
+        if moved_count: cprint(f"Copied {moved_count} existing backup file(s) to the new destination.")
+    if key == "encrypt_backups":
+        if value == "true": ensure_secret_file(key_file(db, "backup_encryption.key")); cprint("A private encryption key was created for this database.", YELLOW)
+    if key == "sign_manifest" and value == "true": ensure_secret_file(key_file(db, "backup_manifest.key"))
+
+
+def open_log_terminal(db: str, func: str, log_path: pathlib.Path) -> None:
+    title = f"Custom DB Manager - {db} - {func}"
+    quoted_log = shlex.quote(str(log_path))
+    quoted_db = shlex.quote(db)
+    shell_cmd = (
+        "printf '\\033[0;36m==================================================\\033[0m\\n'; "
+        "printf '\\033[1m        CUSTOM DB MANAGER CLI - Version 1.0     \\033[0m\\n'; "
+        "printf '\\033[0;36m==================================================\\033[0m\\n'; "
+        "printf \" Type 'help' for commands or 'exit' to quit.\\n\\n\"; "
+        "printf ' Backup monitor for database: %s\\n' " + quoted_db + "; "
+        "printf ' Closing this window also closes only the log viewer.\\n\\n'; "
+        "tail -n 20 -F " + quoted_log
+    )
+    viewer_pid = dirs(db)["secrets"] / f"backup_{func}_viewer.pid"
+    stop_pid_file(viewer_pid)
+    token = uuid.uuid4().hex
+    env = process_env(token)
+    candidates = []
+    if shutil.which("gnome-terminal"):
+        candidates.append(["gnome-terminal", "--wait", "--title", title, "--", "bash", "-lc", shell_cmd])
+    if shutil.which("konsole"):
+        candidates.append(["konsole", "--nofork", "--new-tab", "-p", f"tabtitle={title}", "-e", "bash", "-lc", shell_cmd])
+    if shutil.which("xterm"):
+        candidates.append(["xterm", "-T", title, "-e", "bash", "-lc", shell_cmd])
+    if shutil.which("x-terminal-emulator"):
+        candidates.append(["x-terminal-emulator", "-e", "bash", "-lc", shell_cmd])
+    for cmd in candidates:
+        try:
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, start_new_session=True,
+                                    close_fds=True, env=env)
+            time.sleep(0.2)
+            if proc.poll() is None:
+                write_managed_pid(viewer_pid, proc, token, f"backup-viewer:{db}:{func}")
+                return
+        except Exception:
+            continue
+    cprint(f"No graphical terminal was found. Backup logs are being saved to: {log_path}", YELLOW)
+
+
+def start_worker(db: str, func: str, interval: str) -> None:
+    d = ensure_db_layout(db)
+    secs = parse_interval(interval)
+    pid_file = d["secrets"] / f"backup_{func}.pid"
+    if process_alive(pid_file):
+        cprint(f"Backup function '{func}' is already active (PID {pid_value(pid_file)}).", YELLOW)
+        return
+    log_path = d["secrets"] / f"backup_{func}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_handle = log_path.open("ab", buffering=0)
+    token = uuid.uuid4().hex
+    cmd = ["bash", str(SHELL_SCRIPT), "--db-manager-internal", "--worker", db, func, str(secs)]
+    # Always use a dedicated session/process group. This makes termination
+    # deterministic even when background_daemon is false in older configs.
+    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log_handle, stderr=log_handle,
+                            start_new_session=True, cwd=pathlib.Path.cwd(), close_fds=True,
+                            env=process_env(token))
+    log_handle.close()
+    time.sleep(0.25)
+    if proc.poll() is not None:
+        raise RuntimeError(f"Backup worker failed to start. Check {log_path}.")
+    write_managed_pid(pid_file, proc, token, f"backup-worker:{db}:{func}")
+    cprint(f"Backup function '{func}' scheduled successfully with interval {interval} (PID: {proc.pid}).")
+    open_log_terminal(db, func, log_path)
+
+
+def backup_schedule(db: str, args: list[str]) -> None:
+    d = ensure_db_layout(db)
+    if not args:
+        print(f"{CYAN}{BOLD}Backup Schedule Functions ({db}):{RESET}")
+        for line in d["schedule_cfg"].read_text(encoding="utf-8").splitlines():
+            if not line.strip() or "=" not in line: continue
+            name, val = line.split("=", 1)
+            status, _, interval = val.partition(":")
+            pid = d["secrets"] / f"backup_{name}.pid"
+            proc = str(pid_value(pid)) if process_alive(pid) else "Stopped"
+            viewer = d["secrets"] / f"backup_{name}_viewer.pid"
+            viewer_status = "Open" if process_alive(viewer) else "Closed"
+            print(f"  - {CYAN}{name}{RESET} -> Status: {YELLOW}{status}{RESET}, Interval: {interval}, Process: {proc}, Log CLI: {viewer_status}")
+        return
+    if len(args) not in (2, 3): raise ValueError("Usage: backup_schedule <backup|backup_delete> <true|false> [interval]")
+    func, status = args[0], parse_bool(args[1])
+    if func not in ("backup", "backup_delete"): raise ValueError("Function must be 'backup' or 'backup_delete'.")
+    cfg = read_backup_config(db)
+    default = cfg_value(cfg, "default_interval", "1h") if func == "backup" else "1d"
+    interval = args[2] if len(args) == 3 else default
+    parse_interval(interval)
+    entries: dict[str, str] = {}
+    for line in d["schedule_cfg"].read_text(encoding="utf-8", errors="replace").splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1); entries[k.strip()] = v.strip()
+    entries[func] = f"{status}:{interval}"
+    d["schedule_cfg"].write_text("".join(f"{k}={v}\n" for k, v in entries.items()), encoding="utf-8")
+    pid_file = d["secrets"] / f"backup_{func}.pid"
+    if status == "true":
+        stop_backup_worker(db, func)
+        start_worker(db, func, interval)
+    else:
+        # Disable means stop both the hidden worker and its visible log CLI.
+        stop_backup_worker(db, func)
+        cprint(f"Backup function '{func}' disabled successfully; its worker and log CLI were closed.")
+
+
+def worker_log(message: str) -> None:
+    print(f"{GREEN}{message}{RESET}", flush=True)
+
+
+def worker_enabled(db: str, func: str) -> bool:
+    path = dirs(db)["secrets"] / "backup_schedule.cfg"
+    try:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if "=" not in line: continue
+            name, value = line.split("=", 1)
+            if name.strip() == func:
+                status, _, _interval = value.partition(":")
+                return status.strip().lower() == "true"
+    except OSError:
+        return False
+    return False
+
+
+def worker_main(db: str, func: str, interval: int) -> None:
+    ensure_db_layout(db)
+    worker_pid_file = dirs(db)["secrets"] / f"backup_{func}.pid"
+    viewer_pid_file = dirs(db)["secrets"] / f"backup_{func}_viewer.pid"
+    stop_event = threading.Event()
+    previous_handlers = {}
+
+    def request_stop(_signum, _frame):
+        stop_event.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        with contextlib.suppress(Exception):
+            previous_handlers[sig] = signal.signal(sig, request_stop)
+
+    prefix = "BACKUP" if func == "backup" else "BCKUP_DEL"
+    worker_log(f"[{prefix}] Worker started for database '{db}' (interval: {interval}s).")
+    try:
+        next_run = time.monotonic() + interval
+        while not stop_event.is_set():
+            if not worker_enabled(db, func):
+                worker_log(f"[{prefix}] Schedule changed to false; stopping worker and closing its log CLI.")
+                stop_pid_file(viewer_pid_file)
+                break
+            remaining = next_run - time.monotonic()
+            if remaining > 0:
+                stop_event.wait(min(1.0, remaining))
+                continue
+            try:
+                if func == "backup":
+                    stamp = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                    prefix_name = cfg_value(read_backup_config(db), "default_backup_name", "auto") or "auto"
+                    create_backup(db, f"{prefix_name}-{stamp}", force=False, automated=True, logger=worker_log)
+                else:
+                    run_cleanup(db, read_backup_config(db), worker_log)
+            except Exception as exc:
+                worker_log(f"[{prefix}] ERROR: {exc}")
+            next_run = time.monotonic() + interval
+    finally:
+        stop_pid_file(viewer_pid_file)
+        remove_managed_pid(worker_pid_file, os.environ.get("DBM_PROCESS_TOKEN"))
+        for sig, handler in previous_handlers.items():
+            with contextlib.suppress(Exception): signal.signal(sig, handler)
+
+
+def db_create(args: list[str]) -> None:
+    if not args: raise ValueError("Usage: create_database <name>")
+    for name in args:
+        valid_name(name, "database name")
+        target = db_dir(name)
+        if target.exists():
+            cprint(f"Error: Database '{name}' already exists.", RED); continue
+        ensure_db_layout(name)
+        cprint(f"Database '{name}' created successfully.")
+
+
+def db_drop(args: list[str]) -> None:
+    if not args: raise ValueError("Usage: drop_database <name>")
+    for name in args:
+        target = db_dir(name)
+        if not target.exists(): cprint(f"Error: Database '{name}' does not exist.", RED); continue
+        for kind in ("public", "secret"):
+            stop_pid_file(target / "api" / kind / "api.pid")
+        for func in ("backup", "backup_delete"):
+            stop_backup_worker(name, func)
+        shutil.rmtree(target)
+        cprint(f"Database '{name}' dropped successfully.")
+
+
+def db_rename(args: list[str]) -> None:
+    if len(args) != 2: raise ValueError("Usage: rename_database <name> <newname>")
+    old, new = args
+    src, dst = db_dir(old), db_dir(new)
+    if not src.exists(): raise FileNotFoundError(f"Database '{old}' does not exist.")
+    if dst.exists(): raise FileExistsError(f"Database '{new}' already exists.")
+    active_apis = running_api_types(old)
+    active_workers = {}
+    schedule_values = {}
+    schedule_file = src / "secrets" / "backup_schedule.cfg"
+    if schedule_file.exists():
+        for line in schedule_file.read_text(encoding="utf-8", errors="replace").splitlines():
+            if "=" in line:
+                fn, value = line.split("=", 1)
+                status, _, interval = value.partition(":")
+                schedule_values[fn.strip()] = (status.strip(), interval.strip())
+                active_workers[fn.strip()] = process_alive(src / "secrets" / f"backup_{fn.strip()}.pid")
+    for kind in ("public", "secret"): stop_pid_file(src / "api" / kind / "api.pid")
+    for func in ("backup", "backup_delete"): stop_backup_worker(old, func)
+    src.rename(dst)
+    meta = dst / f"{old}.db"
+    if meta.exists():
+        data = json.loads(meta.read_text(encoding="utf-8")); data["database"] = new
+        (dst / f"{new}.db").write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        meta.unlink()
+    cprint(f"Database '{old}' renamed to '{new}' successfully.")
+    for kind in active_apis:
+        try: api_start(new, kind)
+        except Exception as exc: cprint(f"Warning: API ({kind}) was not restarted: {exc}", YELLOW)
+    for func, was_active in active_workers.items():
+        status, interval = schedule_values.get(func, ("false", ""))
+        if was_active and status == "true" and interval:
+            with contextlib.suppress(Exception): start_worker(new, func, interval)
+
+
+def system_process(db: str | None) -> None:
+    found = False
+    if DB_ROOT.exists():
+        for base in sorted(p for p in DB_ROOT.iterdir() if p.is_dir()):
+            name = base.name
+            for kind in ("public", "secret"):
+                pf = base / "api" / kind / "api.pid"
+                if pf.exists():
+                    if process_alive(pf):
+                        found = True; print(f"  - API Server ({kind}): Database: {name} -> Running, PID: {pid_value(pf)}")
+                    else: remove_managed_pid(pf)
+            for func in ("backup", "backup_delete"):
+                pf = base / "secrets" / f"backup_{func}.pid"
+                if pf.exists():
+                    if process_alive(pf):
+                        found = True; print(f"  - Backup Process: Function: {func}, Database: {name} -> Running, PID: {pid_value(pf)}")
+                    else: remove_managed_pid(pf)
+                viewer = base / "secrets" / f"backup_{func}_viewer.pid"
+                if viewer.exists():
+                    if process_alive(viewer):
+                        found = True; print(f"  - Backup Log CLI: Function: {func}, Database: {name} -> Open, PID: {pid_value(viewer)}")
+                    else: remove_managed_pid(viewer)
+    if not found: print("  (No active managed processes found)")
+
+
+def system_terminate(force: bool) -> None:
+    if not force:
+        answer = input("Warning: terminate all managed processes and remove 'db_manage'. Proceed? (yes/no): ").strip().lower()
+        if answer != "yes": cprint("Action cancelled.", YELLOW); return
+    if DB_ROOT.exists():
+        for base in [p for p in DB_ROOT.iterdir() if p.is_dir()]:
+            for kind in ("public", "secret"): stop_pid_file(base / "api" / kind / "api.pid")
+            for func in ("backup", "backup_delete"): stop_backup_worker(base.name, func)
+    shutil.rmtree(ROOT, ignore_errors=True)
+    (ROOT / "database").mkdir(parents=True, exist_ok=True)
+    (ROOT / "runtime").mkdir(parents=True, exist_ok=True)
+    cprint("System terminated successfully. Managed processes were stopped and db_manage was restored.")
+    show_cli_banner()
+
+
+def table_show(db: str, args: list[str]) -> None:
+    d = ensure_db_layout(db)
+    if args:
+        table = valid_name(args[0], "table name")
+        tdir = d["tables"] / table
+        if not tdir.is_dir(): raise FileNotFoundError(f"Table '{table}' does not exist in database '{db}'.")
+        cols = [x.rstrip("\r\n") for x in (tdir / "columns").read_text(encoding="utf-8").splitlines() if x.strip()]
+        records = [x.rstrip("\r\n") for x in (tdir / "tables").read_text(encoding="utf-8").splitlines() if x.strip()]
+        rows = [cols] + [[x for x in r.split(" ")] for r in records]
+        n = len(cols)
+        for row in rows:
+            if len(row) < n: row.extend([""] * (n - len(row)))
+            del row[n:]
+        widths = [max(4, *(len(r[i]) for r in rows)) for i in range(n)]
+        def rowfmt(row: list[str]) -> str:
+            return "│ " + " │ ".join(row[i].ljust(widths[i]) for i in range(n)) + " │"
+        print(f"{CYAN}{BOLD}Complete Table View: '{table}'{RESET}")
+        print("┌" + "┬".join("─" * (w + 2) for w in widths) + "┐")
+        print(rowfmt(rows[0]))
+        print("├" + "┼".join("─" * (w + 2) for w in widths) + "┤")
+        if len(rows) == 1: print(rowfmt([""] * n))
+        else:
+            for idx, row in enumerate(rows[1:]):
+                print(rowfmt(row))
+                if idx < len(rows) - 2: print("├" + "┼".join("─" * (w + 2) for w in widths) + "┤")
+        print("└" + "┴".join("─" * (w + 2) for w in widths) + "┘")
+        return
+    tables = sorted(p.name for p in d["tables"].iterdir() if p.is_dir())
+    if not tables:
+        cprint(f"Error: No tables exist in database '{db}'.", RED); return
+    width = max(15, len("TABLES"), *(len(x) for x in tables))
+    print(f"{CYAN}{BOLD}Tables in database '{db}':{RESET}")
+    print("┌" + "─" * (width + 2) + "┐")
+    print("│ " + f"{'TABLES':<{width}}" + " │")
+    print("├" + "─" * (width + 2) + "┤")
+    for name in tables: print("│ " + f"{name:<{width}}" + " │")
+    print("└" + "─" * (width + 2) + "┘")
+
+
+def table_insert(db: str, args: list[str]) -> None:
+    if len(args) < 2: raise ValueError("Usage: insert_into <table> <column> <value> [<column> <value> ...] or insert_into <table> value1|value2")
+    d = ensure_db_layout(db)
+    table = valid_name(args[0], "table name")
+    tdir = d["tables"] / table
+    if not tdir.is_dir(): raise FileNotFoundError(f"Table '{table}' does not exist.")
+    cols = [x.strip() for x in (tdir / "columns").read_text(encoding="utf-8").splitlines() if x.strip()]
+    if not cols: cols = ["id"]
+    row = [""] * len(cols)
+    rest = args[1:]
+    mapping: dict[int, str] = {}
+    if len(rest) == 1 and "|" in rest[0]:
+        vals = rest[0].split("|")
+        start = 1 if cols[0] == "id" else 0
+        for i, v in enumerate(vals):
+            if start + i < len(cols): mapping[start + i] = v
+    elif rest[0] in cols:
+        if len(rest) % 2: raise ValueError("Column/value pairs are incomplete. Provide a value for every column.")
+        i = 0
+        while i < len(rest):
+            col = rest[i]
+            if col not in cols: raise ValueError(f"Column '{col}' does not exist in table '{table}'.")
+            if col == "id": raise ValueError("The primary id column is generated automatically.")
+            mapping[cols.index(col)] = rest[i + 1]
+            i += 2
+    else:
+        start = 1 if cols[0] == "id" else 0
+        for i, v in enumerate(rest):
+            if start + i < len(cols): mapping[start + i] = v
+    if not mapping: raise ValueError("No valid column values were provided.")
+    data_file = tdir / "tables"
+    old = [line.rstrip("\r\n") for line in data_file.read_text(encoding="utf-8").splitlines() if line.strip()] if data_file.exists() else []
+    rows = []
+    for line in old:
+        values = line.split(" ")
+        values += [""] * (len(cols) - len(values))
+        rows.append(values[:len(cols)])
+    # Retain the original manager's behaviour: fill a fully empty slot if one exists, otherwise append.
+    slot = next((i for i, values in enumerate(rows) if all(values[k] == "" for k in mapping)), None)
+    if slot is None:
+        row = [""] * len(cols)
+        if cols[0] == "id": row[0] = str(len(rows) + 1)
+        rows.append(row); slot = len(rows) - 1
+    elif cols[0] == "id" and not rows[slot][0]:
+        rows[slot][0] = str(slot + 1)
+    for idx, value in mapping.items():
+        if any(ch.isspace() for ch in value):
+            raise ValueError("Values cannot contain spaces in the current text-table storage format.")
+        rows[slot][idx] = value.replace("\n", "").replace("\r", "")
+    tmp = data_file.with_suffix(".tmp")
+    tmp.write_text("".join(" ".join(values) + "\n" for values in rows), encoding="utf-8")
+    tmp.replace(data_file)
+    values_desc = ", ".join(f"{cols[i]}='{rows[slot][i]}'" for i in mapping)
+    cprint(f"Table '{table}': inserted data ({values_desc}).")
+
+
+def readline_main(db: str, host: str, output_file: str) -> None:
+    migrate_legacy_storage()
+    if db and db != "none" and (DB_ROOT / db).is_dir():
+        hist = DB_ROOT / db / ".cli_history"
+    else:
+        hist = ROOT / "runtime" / ".cli_history"
+    hist.parent.mkdir(parents=True, exist_ok=True)
+    try: readline.read_history_file(str(hist))
+    except (FileNotFoundError, OSError): pass
+    readline.set_history_length(10000)
+    prompt = f"\001{CYAN}\002{host}\001{RESET}\002@\001{CYAN}\002{db or 'none'}\001{RESET}\002 -> "
+    line = "exit"
+    # Keep readline's stdin/stdout attached to the real terminal even though the
+    # Bash caller captures the result through a temporary file.
+    try:
+        out = open(output_file, "w", encoding="utf-8")
+        if os.isatty(0) and os.path.exists("/dev/tty"):
+            tty_fd = os.open("/dev/tty", os.O_RDWR)
+            saved_in, saved_out = os.dup(0), os.dup(1)
+            try:
+                os.dup2(tty_fd, 0); os.dup2(tty_fd, 1)
+                line = input(prompt)
+            finally:
+                os.dup2(saved_in, 0); os.dup2(saved_out, 1)
+                os.close(saved_in); os.close(saved_out); os.close(tty_fd)
+        else:
+            sys.stderr.write(prompt); sys.stderr.flush()
+            line = sys.stdin.readline().rstrip("\n") or "exit"
+        if line.strip():
+            try: readline.write_history_file(str(hist))
+            except OSError: pass
+        out.write(line); out.close()
+    except EOFError:
+        with open(output_file, "w", encoding="utf-8") as out: out.write("exit")
+    except OSError:
+        with open(output_file, "w", encoding="utf-8") as out: out.write("exit")
+
+
+
+def table_paths(db: str, table: str) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
+    d = ensure_db_layout(db)
+    table = valid_name(table, "table name")
+    folder = d["tables"] / table
+    return folder, folder / "columns", folder / "tables"
+
+
+def read_table(db: str, table: str) -> tuple[list[str], list[list[str]], pathlib.Path]:
+    folder, columns_file, data_file = table_paths(db, table)
+    if not folder.is_dir():
+        raise FileNotFoundError(f"Table '{table}' does not exist in database '{db}'.")
+    cols = [x.strip() for x in columns_file.read_text(encoding="utf-8").splitlines() if x.strip()] if columns_file.exists() else ["id"]
+    if not cols:
+        cols = ["id"]
+    rows: list[list[str]] = []
+    if data_file.exists():
+        for line in data_file.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not line.strip():
+                continue
+            values = line.split(" ")
+            values.extend([""] * max(0, len(cols) - len(values)))
+            rows.append(values[:len(cols)])
+    return cols, rows, data_file
+
+
+def write_table(columns: list[str], rows: list[list[str]], data_file: pathlib.Path) -> None:
+    tmp = data_file.with_suffix(data_file.suffix + ".tmp")
+    tmp.write_text("".join(" ".join(row[:len(columns)]) + "\n" for row in rows), encoding="utf-8")
+    tmp.replace(data_file)
+
+
+def list_databases() -> None:
+    items = sorted(p.name for p in DB_ROOT.iterdir() if p.is_dir() and (p / f"{p.name}.db").is_file()) if DB_ROOT.exists() else []
+    if not items:
+        cprint("Error: No databases exist.", RED)
+        return
+    print(f"{CYAN}{BOLD}Available databases:{RESET}")
+    for name in items:
+        print(f"  - {GREEN}{name}{RESET}")
+
+
+def database_describe(db: str, metadata_only: bool = False) -> None:
+    db = valid_name(db, "database name")
+    if not (db_dir(db) / f"{db}.db").is_file():
+        raise FileNotFoundError(f"Database '{db}' does not exist.")
+    d = ensure_db_layout(db)
+    meta = d["base"] / f"{db}.db"
+    print(f"{CYAN}{BOLD}Database Structure for '{db}':{RESET}")
+    if meta.exists():
+        try:
+            print(json.dumps(json.loads(meta.read_text(encoding="utf-8")), indent=2, ensure_ascii=False))
+        except Exception:
+            print(meta.read_text(encoding="utf-8", errors="replace"))
+    if metadata_only:
+        return
+    for folder in sorted(p for p in d["tables"].iterdir() if p.is_dir()):
+        cols, rows, _ = read_table(db, folder.name)
+        print(f"\n{CYAN}{BOLD}Table: {folder.name}{RESET}")
+        matrix = [cols] + rows
+        widths = [max(4, *(len(row[i]) for row in matrix)) for i in range(len(cols))]
+        def fmt(row: list[str]) -> str:
+            return "│ " + " │ ".join(row[i].ljust(widths[i]) for i in range(len(cols))) + " │"
+        print("┌" + "┬".join("─" * (w + 2) for w in widths) + "┐")
+        print(fmt(cols))
+        print("├" + "┼".join("─" * (w + 2) for w in widths) + "┤")
+        if rows:
+            for row in rows:
+                print(fmt(row))
+        else:
+            print(fmt([""] * len(cols)))
+        print("└" + "┴".join("─" * (w + 2) for w in widths) + "┘")
+
+
+def table_create(db: str, names: list[str]) -> None:
+    if not names:
+        raise ValueError("Usage: create_table <name>")
+    d = ensure_db_layout(db)
+    for name in names:
+        folder = d["tables"] / valid_name(name, "table name")
+        if folder.exists():
+            cprint(f"Error: Table '{name}' already exists.", RED)
+            continue
+        folder.mkdir(parents=True)
+        (folder / "columns").write_text("id\n", encoding="utf-8")
+        (folder / "tables").touch()
+        cprint(f"Table '{name}' created successfully.")
+
+
+def table_drop(db: str, names: list[str]) -> None:
+    if not names:
+        raise ValueError("Usage: drop_table <name>")
+    d = ensure_db_layout(db)
+    for name in names:
+        folder = d["tables"] / valid_name(name, "table name")
+        if not folder.is_dir():
+            cprint(f"Error: Table '{name}' does not exist.", RED)
+            continue
+        shutil.rmtree(folder)
+        cprint(f"Table '{name}' dropped successfully.")
+
+
+def table_rename(db: str, args: list[str]) -> None:
+    if len(args) != 2:
+        raise ValueError("Usage: rename_table <name> <newname>")
+    old, new = args
+    d = ensure_db_layout(db)
+    src = d["tables"] / valid_name(old, "table name")
+    dst = d["tables"] / valid_name(new, "table name")
+    if not src.is_dir(): raise FileNotFoundError(f"Table '{old}' does not exist.")
+    if dst.exists(): raise FileExistsError(f"Table '{new}' already exists.")
+    src.rename(dst)
+    cprint(f"Table '{old}' renamed to '{new}' successfully.")
+
+
+def column_create(db: str, args: list[str]) -> None:
+    if len(args) < 2: raise ValueError("Usage: create_column <table> <column> [column ...]")
+    table, names = args[0], args[1:]
+    cols, rows, data_file = read_table(db, table)
+    for name in names:
+        valid_name(name, "column name")
+        if name in cols:
+            cprint(f"Error: Column '{name}' already exists in table '{table}'.", RED)
+            continue
+        cols.append(name)
+        for row in rows: row.append("")
+        cprint(f"Column '{name}' added to table '{table}'.")
+    folder, columns_file, _ = table_paths(db, table)
+    columns_file.write_text("".join(c + "\n" for c in cols), encoding="utf-8")
+    write_table(cols, rows, data_file)
+
+
+def column_drop(db: str, args: list[str]) -> None:
+    if len(args) != 2: raise ValueError("Usage: drop_column <table> <column>")
+    table, name = args
+    cols, rows, data_file = read_table(db, table)
+    if name not in cols: raise ValueError(f"Column '{name}' does not exist in table '{table}'.")
+    if name == "id": raise ValueError("Cannot drop primary id column.")
+    index = cols.index(name)
+    cols.pop(index)
+    for row in rows:
+        if index < len(row): row.pop(index)
+    _, columns_file, _ = table_paths(db, table)
+    columns_file.write_text("".join(c + "\n" for c in cols), encoding="utf-8")
+    write_table(cols, rows, data_file)
+    cprint(f"Column '{name}' dropped from table '{table}'.")
+
+
+def column_show(db: str, table: str) -> None:
+    cols, _, _ = read_table(db, table)
+    width = max(15, max((len(c) for c in cols), default=0), len("COLUMNS"))
+    print("┌" + "─" * (width + 2) + "┐")
+    print("│ " + f"{'COLUMNS':<{width}}" + " │")
+    print("├" + "─" * (width + 2) + "┤")
+    for col in cols: print("│ " + f"{col:<{width}}" + " │")
+    print("└" + "─" * (width + 2) + "┘")
+
+
+def column_rename(db: str, args: list[str]) -> None:
+    if len(args) != 3: raise ValueError("Usage: rename_column <table> <column> <newcolumn>")
+    table, old, new = args
+    valid_name(new, "column name")
+    cols, _, _ = read_table(db, table)
+    if old not in cols: raise ValueError(f"Column '{old}' does not exist.")
+    if new in cols: raise ValueError(f"Column '{new}' already exists.")
+    cols[cols.index(old)] = new
+    _, columns_file, _ = table_paths(db, table)
+    columns_file.write_text("".join(c + "\n" for c in cols), encoding="utf-8")
+    cprint(f"Column '{old}' renamed to '{new}'.")
+
+
+def select_tables(db: str, names: list[str]) -> None:
+    if not names: raise ValueError("Usage: select_from <table>")
+    for name in names:
+        table_show(db, [name])
+
+
+def update_rows(db: str, args: list[str]) -> None:
+    if len(args) != 4: raise ValueError("Usage: update <table> <column> <value> <newvalue>")
+    table, col, old, new = args
+    cols, rows, data_file = read_table(db, table)
+    if col not in cols: raise ValueError(f"Column '{col}' does not exist.")
+    if any(ch.isspace() for ch in new): raise ValueError("Values cannot contain spaces in the current text-table storage format.")
+    idx = cols.index(col)
+    count = 0
+    for row in rows:
+        if row[idx] == old:
+            row[idx] = new
+            count += 1
+    write_table(cols, rows, data_file)
+    cprint(f"Updated {count} record(s).")
+
+
+def delete_rows(db: str, args: list[str]) -> None:
+    if len(args) != 1: raise ValueError("Usage: delete_from <table>")
+    table = args[0]
+    cols, rows, data_file = read_table(db, table)
+    count = len(rows)
+    write_table(cols, [], data_file)
+    cprint(f"All {count} record(s) deleted from table '{table}'.")
+
+
+def delete_record_rows(db: str, args: list[str]) -> None:
+    if len(args) < 2: raise ValueError("Usage: delete_record <table> <column> <value> OR delete_record <table> <record>")
+    table = args[0]
+    cols, rows, data_file = read_table(db, table)
+    if len(args) >= 3 and args[1] in cols:
+        col, target = args[1], " ".join(args[2:])
+        idx = cols.index(col)
+        remaining = [row for row in rows if row[idx] != target]
+        removed = len(rows) - len(remaining)
+        if not removed: raise FileNotFoundError(f"Record not found in column '{col}'.")
+    else:
+        target = " ".join(args[1:])
+        remaining = [row for row in rows if " ".join(row) != target]
+        removed = len(rows) - len(remaining)
+        if not removed: raise FileNotFoundError(f"Record '{target}' not found.")
+    write_table(cols, remaining, data_file)
+    cprint(f"{removed} record(s) deleted from table '{table}'.")
+
+
+def api_permissions_command(db: str, args: list[str]) -> None:
+    d = ensure_db_layout(db)
+    path = d["api"] / "public" / "permissions.cfg"
+    defaults = {"show_tables": "false", "dump_db": "false", "select_from": "false", "insert_into": "false",
+                "create_table": "false", "drop_table": "false", "delete_from": "false", "delete_record": "false",
+                "create_column": "false", "drop_column": "false", "show_columns": "false", "rename_column": "false",
+                "update": "false", "rename_table": "false"}
+    current = defaults.copy(); current.update(read_kv(path))
+    if not args:
+        print(f"{CYAN}{BOLD}Public API Permissions for '{db}':{RESET}")
+        for key, val in current.items(): print(f"  - {CYAN}{key}{RESET}: {YELLOW}{val}{RESET}")
+        return
+    if len(args) != 2: raise ValueError("Usage: api_permissions <permission> <true|false>")
+    name, value = args
+    if name not in defaults: raise ValueError(f"Permission '{name}' does not exist.")
+    current[name] = parse_bool(value)
+    write_kv(path, current, 0o600)
+    cprint(f"Permission '{name}' updated successfully to '{value}'.")
+
+
+def dispatch(db: str, command: str, raw_args: str) -> int:
+    """Return 0 when handled, 2 when the original Bash CLI should handle it."""
+    migrate_legacy_storage()
+    command = command.strip()
+    args = parse_args(raw_args)
+    try:
+        # Database lifecycle: use stays with Bash so its CURRENT_DB prompt is updated.
+        if command == "create_database":
+            parts = [parse_args(part)[0] for part in raw_args.split("&") if parse_args(part)] if "&" in raw_args else args
+            db_create(parts); return 0
+        if command == "drop_database":
+            parts = [parse_args(part)[0] for part in raw_args.split("&") if parse_args(part)] if "&" in raw_args else args
+            db_drop(parts); return 0
+        if command == "use":
+            if len(args) != 1: raise ValueError("Usage: use <name>")
+            name = valid_name(args[0], "database name")
+            if not (db_dir(name) / f"{name}.db").is_file():
+                raise FileNotFoundError(f"Database '{name}' does not exist.")
+            ensure_db_layout(name)
+            cprint(f"Switched to database: {name}")
+            return 0
+        if command == "rename_database":
+            rename_args = [parse_args(part)[0] for part in raw_args.split("&") if parse_args(part)] if "&" in raw_args else args
+            db_rename(rename_args); return 0
+        if command == "system_process":
+            if args and args[0] == "kill":
+                if len(args) != 2: raise ValueError("Usage: system_process kill <process|pid>")
+                target = args[1]
+                killed = False
+                if DB_ROOT.exists():
+                    for base in [p for p in DB_ROOT.iterdir() if p.is_dir()]:
+                        db_name = base.name
+                        for api_type in ("public", "secret"):
+                            pf = base / "api" / api_type / "api.pid"
+                            matches = (target == db_name or target == api_type or target == f"{db_name}-{api_type}"
+                                       or (target.isdigit() and pid_value(pf) == int(target)))
+                            if matches and pf.exists():
+                                killed = stop_pid_file(pf) or killed
+                        for func in ("backup", "backup_delete"):
+                            pf = base / "secrets" / f"backup_{func}.pid"
+                            viewer_pf = base / "secrets" / f"backup_{func}_viewer.pid"
+                            matches = (target == db_name or target in (func, f"backup_{func}")
+                                       or (target.isdigit() and (pid_value(pf) == int(target) or pid_value(viewer_pf) == int(target))))
+                            if matches:
+                                killed = stop_backup_worker(db_name, func) or killed
+                if not killed:
+                    raise FileNotFoundError(f"Managed process '{target}' not found or could not be terminated. Arbitrary system PIDs are not accepted.")
+                cprint(f"Managed process '{target}' and its child processes were terminated successfully.")
+            else:
+                system_process(db)
+            return 0
+        if command == "system_terminate": system_terminate("--force" in args); return 0
+        if command == "api_key":
+            if db == "none": raise ValueError("No active database. Use 'use <name>' first.")
+            api_key_command(db, args); return 0
+        if command == "api_key_add":
+            if db == "none": raise ValueError("No active database. Use 'use <name>' first.")
+            api_key_command(db, ["add"] + args); return 0
+        if command == "api_key_remove":
+            if db == "none": raise ValueError("No active database. Use 'use <name>' first.")
+            api_key_command(db, ["remove"] + args); return 0
+        if command == "api_key_list":
+            if db == "none": raise ValueError("No active database. Use 'use <name>' first.")
+            api_key_command(db, ["list"]); return 0
+        if command in ("api_setup", "api_edit", "api_start", "api_stop", "api_delete", "api_status", "api_request"):
+            if db == "none": raise ValueError("No active database. Use 'use <name>' first.")
+            if command == "api_request": api_request(db, args); return 0
+            api_type = args[0] if args else "public"
+            if api_type not in ("public", "secret"): raise ValueError("API type must be 'public' or 'secret'.")
+            if command == "api_setup": api_setup(db, api_type)
+            elif command == "api_edit": api_edit(db, api_type)
+            elif command == "api_start": api_start(db, api_type)
+            elif command == "api_stop":
+                pid_path = api_cfg_path(db, api_type).parent / "api.pid"
+                if not process_alive(pid_path):
+                    stop_pid_file(pid_path)
+                    cprint(f"API ({api_type}) is not currently running.", YELLOW)
+                else:
+                    stop_pid_file(pid_path); cprint(f"API ({api_type}) stopped successfully.")
+            elif command == "api_delete":
+                p = api_cfg_path(db, api_type).parent
+                if not (p / "api.cfg").exists(): raise FileNotFoundError(f"API ({api_type}) does not exist.")
+                stop_pid_file(p / "api.pid")
+                if p.exists(): shutil.rmtree(p)
+                cprint(f"API ({api_type}) deleted successfully.")
+            elif command == "api_status": api_status(db, api_type)
+            return 0
+        if command == "backup":
+            if db == "none": raise ValueError("No active database. Use 'use <name>' first.")
+            force = "--force" in args
+            names = [x for x in args if x != "--force"]
+            if len(names) > 1: raise ValueError("Backup name cannot contain spaces. Usage: backup <name> [--force]")
+            backup_name = names[0] if names else None
+            if backup_name:
+                valid_backup_name(backup_name)
+                cfg = read_backup_config(db)
+                suffix = ".tar.gz" if cfg_value(cfg, "auto_compression", "true").lower() == "true" else ".tar"
+                if cfg_value(cfg, "encrypt_backups", "false").lower() == "true": suffix += ".enc"
+                existing = backup_directory(db, cfg) / (backup_name + suffix)
+                if existing.exists() and not force:
+                    answer = input(f"Warning: Backup '{backup_name}' already exists and will be overwritten. Proceed? (yes/no): ").strip().lower()
+                    if answer != "yes": cprint("Action cancelled.", YELLOW); return 0
+                    force = True
+            create_backup(db, backup_name, force=force); return 0
+        if command == "backups":
+            if db == "none": raise ValueError("No active database. Use 'use <name>' first.")
+            show_backups(db); return 0
+        if command == "backup_restore":
+            if db == "none": raise ValueError("No active database. Use 'use <name>' first.")
+            force = "--force" in args; names = [x for x in args if x != "--force"]
+            if len(names) != 1: raise ValueError("Usage: backup_restore <name> [--force]")
+            restore_backup(db, names[0], force); return 0
+        if command == "backup_delete":
+            if db == "none": raise ValueError("No active database. Use 'use <name>' first.")
+            force = "--force" in args; names = [x for x in args if x != "--force"]
+            if len(names) != 1: raise ValueError("Usage: backup_delete <name> [--force]")
+            if not force:
+                ans = input(f"Delete backup '{names[0]}'? (yes/no): ").strip().lower()
+                if ans != "yes": cprint("Action cancelled.", YELLOW); return 0
+            delete_backup(db, names[0]); return 0
+        if command == "backup_schedule":
+            if db == "none": raise ValueError("No active database. Use 'use <name>' first.")
+            backup_schedule(db, args); return 0
+        if command == "backup_configs":
+            if db == "none": raise ValueError("No active database. Use 'use <name>' first.")
+            backup_configs(db, args); return 0
+        if command == "show_databases":
+            list_databases(); return 0
+        if command in ("describe", "dump_db"):
+            targets = args if command == "describe" and args else ([db] if not args else [args[0]])
+            if not targets or targets == ["none"]: raise ValueError("Database name required. Usage: describe <name>")
+            for target in targets:
+                database_describe(target, metadata_only=(command == "describe"))
+            return 0
+        if command == "api_permissions":
+            if db == "none": raise ValueError("No active database. Use 'use <name>' first.")
+            api_permissions_command(db, args); return 0
+        if command == "show_tables":
+            if db == "none": raise ValueError("No active database. Use 'use <name>' first.")
+            table_show(db, args); return 0
+        if command == "select_from":
+            if db == "none": raise ValueError("No active database. Use 'use <name>' first.")
+            select_tables(db, args); return 0
+        if command == "insert_into":
+            if db == "none": raise ValueError("No active database. Use 'use <name>' first.")
+            groups = [part.strip() for part in raw_args.split("&") if part.strip()]
+            if not groups: raise ValueError("Usage: insert_into <table> <column> <value> [<column> <value> ...]")
+            for group in groups:
+                table_insert(db, parse_args(group))
+            return 0
+        if command == "create_table":
+            if db == "none": raise ValueError("No active database. Use 'use <name>' first.")
+            parts = [parse_args(part)[0] for part in raw_args.split("&") if parse_args(part)] if "&" in raw_args else args
+            table_create(db, parts); return 0
+        if command == "drop_table":
+            if db == "none": raise ValueError("No active database. Use 'use <name>' first.")
+            parts = [parse_args(part)[0] for part in raw_args.split("&") if parse_args(part)] if "&" in raw_args else args
+            table_drop(db, parts); return 0
+        if command == "rename_table":
+            if db == "none": raise ValueError("No active database. Use 'use <name>' first.")
+            table_rename(db, args); return 0
+        if command == "create_column":
+            if db == "none": raise ValueError("No active database. Use 'use <name>' first.")
+            column_create(db, args); return 0
+        if command == "drop_column":
+            if db == "none": raise ValueError("No active database. Use 'use <name>' first.")
+            column_drop(db, args); return 0
+        if command == "show_columns":
+            if db == "none": raise ValueError("No active database. Use 'use <name>' first.")
+            if len(args) != 1: raise ValueError("Usage: show_columns <table>")
+            column_show(db, args[0]); return 0
+        if command == "rename_column":
+            if db == "none": raise ValueError("No active database. Use 'use <name>' first.")
+            column_rename(db, args); return 0
+        if command == "update":
+            if db == "none": raise ValueError("No active database. Use 'use <name>' first.")
+            update_rows(db, args); return 0
+        if command == "delete_from":
+            if db == "none": raise ValueError("No active database. Use 'use <name>' first.")
+            if not args: raise ValueError("Usage: delete_from <table>")
+            for table_name in args:
+                delete_rows(db, [table_name])
+            return 0
+        if command == "delete_record":
+            if db == "none": raise ValueError("No active database. Use 'use <name>' first.")
+            groups = [parse_args(part) for part in raw_args.split("&") if parse_args(part)] if "&" in raw_args else [args]
+            for group in groups:
+                delete_record_rows(db, group)
+            return 0
+    except KeyboardInterrupt:
+        cprint("Operation cancelled.", YELLOW); return 0
+    except Exception as exc:
+        cprint(f"Error: {exc}", RED); return 0
+    return 2
+
+
+def main() -> int:
+    if len(sys.argv) >= 2 and sys.argv[1] == "--readline":
+        readline_main(sys.argv[2] if len(sys.argv) > 2 else "none", sys.argv[3] if len(sys.argv) > 3 else "localhost",
+                      sys.argv[4] if len(sys.argv) > 4 else "/tmp/db-manager-line")
+        return 0
+    if len(sys.argv) >= 2 and sys.argv[1] == "--serve":
+        server_main(sys.argv[2], sys.argv[3]); return 0
+    if len(sys.argv) >= 2 and sys.argv[1] == "--worker":
+        worker_main(sys.argv[2], sys.argv[3], int(sys.argv[4])); return 0
+    if len(sys.argv) < 4: return 2
+    return dispatch(sys.argv[1], sys.argv[2], sys.argv[3])
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130)
+
+#__DBM_PYTHON_END__
+__DB_MANAGER_PYTHON_PAYLOAD__
