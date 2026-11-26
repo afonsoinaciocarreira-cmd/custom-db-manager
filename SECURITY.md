@@ -3,7 +3,7 @@
 **Security and deployment guidance**  
 **Software version reviewed:** 1.0  
 **Reviewed format:** single Bash file with embedded Python code  
-**Reference source:** `versions/customdb-manager (v1.0)/customdb.sh`
+**Reference source:** `versions/customdb-manager/customdb.sh`
 
 This document describes the controls present in the published code and establishes recommendations for secure use. It is not a certification, independent audit, guarantee of invulnerability, or declaration of regulatory compliance.
 
