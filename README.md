@@ -659,7 +659,7 @@ See **[SECURITY.md](SECURITY.md)** for the security model, deployment recommenda
 - **Product:** Custom DB Manager
 - **Version stated in the code:** 1.0
 - **Format:** a single Bash file with an embedded Python layer
-- **Published file:** `versions/customdb-manager (v1.0)/customdb.sh`
+- **Published file:** `custom-db-manager/customdb.sh`
 - **Repository:** <https://github.com/afonsoinaciocarreira-cmd/custom-db-manager>
 - **Direct source:** <https://raw.githubusercontent.com/afonsoinaciocarreira-cmd/custom-db-manager/refs/heads/main/customdb.sh>
 
